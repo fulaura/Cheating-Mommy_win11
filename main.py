@@ -2,299 +2,986 @@
 from __future__ import annotations
 
 import argparse
-import glob
-import os
-import sys
-import termios
-import tty
-
-
-
+import base64
+import io
 import json
+import getpass
+import os
+import random
+import re
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+import ctypes
+import threading
+import tkinter as tk
 
-from screenshot import take_fullscreen_screenshot, take_screenshot2
-from ocr import ocr
-from ai import generate
-from mouseclick import click_bbox
-from exp.resp_to_cb import copy_to_clipboard
+import requests
+from PIL import Image, ImageGrab
+from pynput import keyboard, mouse
 
-"""Listen for global keyboard events and react to the `p` key.
+from mousemovement import move_cursor_smooth
 
-Requires:
-        pip install evdev
+DEFAULT_SERVER_URL = "https://server-784947522852.europe-west1.run.app"
+DEFAULT_API_KEY = "nbp_92fKxA7qQp1Z"  # your client auth key
+DEFAULT_APP_VERSION = "1.3.0"
 
-Notes:
-        - Reading /dev/input/event* may require root or input-group permissions.
-        - Run with: sudo python print_on_press.py
-        - Optionally choose device: sudo python print_on_press.py --device /dev/input/event3
-"""
-def bbox_for_contains(ocr_results, needle: str, strict: bool = False):
+APPDATA_BASE = os.environ.get("APPDATA") or os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+
+
+def _config_base_dir() -> str:
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+CONFIG_PATH = os.path.join(_config_base_dir(), "config.json")
+DATA_DIR_HINT_PATH = os.path.join(_config_base_dir(), "data_dir.txt")
+APP_META_PATH = os.path.join(_config_base_dir(), "app.txt")
+
+
+def _default_config() -> dict:
+    return {
+        "mouse": {
+            "smooth": True,
+            "duration": 0.18,
+            "steps": 20,
+            "curve_strength": 0.0,
+            "speed": 0.0,
+            "path_mode": "direct",
+            "jitter": 0.0,
+        },
+        "ocr": {
+            "config": "",
+            "mode": "chunk",
+            "x_thresh": 20,
+            "y_thresh": 4,
+            "group_y_thresh": 35,
+            "crop_bbox": [],
+            "crop_clamp": True,
+        },
+        "hotkeys": {
+            "toggle_commands": "l",
+            "window_visibility": "k",
+            "turned_on_by_default": True,
+            "visible_by_default": True,
+            "answer_key": "p",
+            "copy_key": "o",
+            "info_key": "i",
+        },
+        "ui": {
+            "window_pos": "mouse",
+            "window_size": [420, 260],
+            "transparency": 1.0,
+            "background_color": "#111111",
+            "border_color": "#2a2a2a",
+            "border_thickness": 2,
+            "header_visible": True,
+            "logs": {
+                "history_max": 10,
+                "size": 11,
+                "text_color": "#ffffff",
+                "action_log": True,
+            },
+            "hint": {
+                "visible": True,
+                "color": "#888888",
+                "size": 9,
+            },
+        },
+    }
+
+
+def _load_config() -> dict:
+    cfg = _default_config()
+    if os.path.isfile(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                cfg.update(loaded)
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"Warning: invalid config.json, using defaults ({exc})", file=sys.stderr)
+        return cfg
+
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    except OSError as exc:
+        print(f"Warning: could not write config.json ({exc})", file=sys.stderr)
+    return cfg
+
+
+_CONFIG = _load_config()
+_app_name = "Cheating Mommy"
+_app_version = DEFAULT_APP_VERSION
+if os.path.isfile(APP_META_PATH):
+    try:
+        with open(APP_META_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                raw = line.strip()
+                if not raw or raw.startswith("#") or "=" not in raw:
+                    continue
+                key, value = raw.split("=", 1)
+                if key.strip().upper() == "APP_NAME" and value.strip():
+                    _app_name = value.strip()
+                elif key.strip().upper() == "APP_VERSION" and value.strip():
+                    _app_version = value.strip()
+    except OSError:
+        pass
+os.environ.setdefault("APP_NAME", _app_name)
+os.environ.setdefault("APP_VERSION", _app_version)
+APPDATA_DIR = os.path.join(APPDATA_BASE, _app_name)
+if os.path.isfile(DATA_DIR_HINT_PATH):
+    try:
+        with open(DATA_DIR_HINT_PATH, "r", encoding="utf-8") as f:
+            hinted_dir = f.read().strip()
+        if hinted_dir:
+            APPDATA_DIR = hinted_dir
+    except OSError:
+        pass
+CREDENTIALS_PATH = os.path.join(APPDATA_DIR, "credentials.txt")
+
+
+def _load_credentials() -> dict:
+    creds = {
+        "SERVER_URL": DEFAULT_SERVER_URL,
+        "API_KEY": DEFAULT_API_KEY,
+        "ACCESS_KEY": "",
+    }
+    if os.path.isfile(CREDENTIALS_PATH):
+        with open(CREDENTIALS_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                raw = line.strip()
+                if not raw or raw.startswith("#") or "=" not in raw:
+                    continue
+                key, value = raw.split("=", 1)
+                creds[key.strip()] = value.strip()
+        return creds
+
+    os.makedirs(APPDATA_DIR, exist_ok=True)
+    try:
+        creds["ACCESS_KEY"] = getpass.getpass("Access key: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\nCanceled credential entry.", file=sys.stderr)
+    with open(CREDENTIALS_PATH, "w", encoding="utf-8") as f:
+        for key, value in creds.items():
+            f.write(f"{key}={value}\n")
+    return creds
+
+
+_CREDS = _load_credentials()
+SERVER_URL = _CREDS.get("SERVER_URL", DEFAULT_SERVER_URL)
+API_KEY = _CREDS.get("API_KEY", DEFAULT_API_KEY)
+
+from ocr import ocr, warmup_tesseract
+
+
+def _resolve_range(value: object, default: float) -> float:
+    if isinstance(value, list) and len(value) in (1, 2):
+        try:
+            if len(value) == 1:
+                return float(value[0])
+            low = float(value[0])
+            high = float(value[1])
+            if low > high:
+                low, high = high, low
+            return random.uniform(low, high)
+        except (TypeError, ValueError):
+            return float(default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _resolve_int_range(value: object, default: int) -> int:
+    if isinstance(value, list) and len(value) in (1, 2):
+        try:
+            if len(value) == 1:
+                return int(value[0])
+            low = int(value[0])
+            high = int(value[1])
+            if low > high:
+                low, high = high, low
+            return random.randint(low, high)
+        except (TypeError, ValueError):
+            return int(default)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _normalize_crop_bbox(value: object) -> tuple[int, int, int, int] | None:
+    if not isinstance(value, list) or len(value) != 4:
+        return None
+    try:
+        x, y, w, h = (int(value[0]), int(value[1]), int(value[2]), int(value[3]))
+        if w <= 0 or h <= 0:
+            return None
+        return (x, y, w, h)
+    except (TypeError, ValueError):
+        return None
+
+
+def _crop_image(image: Image.Image, bbox: tuple[int, int, int, int], *, clamp: bool) -> Image.Image:
+    x, y, w, h = bbox
+    left, top, right, bottom = x, y, x + w, y + h
+    if clamp:
+        img_w, img_h = image.size
+        left = max(0, min(left, img_w))
+        right = max(0, min(right, img_w))
+        top = max(0, min(top, img_h))
+        bottom = max(0, min(bottom, img_h))
+    if right <= left or bottom <= top:
+        return image
+    return image.crop((left, top, right, bottom))
+
+
+def _set_dpi_awareness() -> None:
+    if os.name != "nt":
+        return
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+_set_dpi_awareness()
+
+user32 = ctypes.WinDLL("user32", use_last_error=True) if os.name == "nt" else None
+GA_ROOT = 2
+WDA_NONE = 0x00000000
+WDA_EXCLUDEFROMCAPTURE = 0x00000011  # Windows 10 v2004+
+GWL_EXSTYLE = -20
+WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_APPWINDOW = 0x00040000
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOZORDER = 0x0004
+SWP_NOACTIVATE = 0x0010
+SWP_FRAMECHANGED = 0x0020
+SW_HIDE = 0
+SW_SHOW = 5
+
+if user32:
+    user32.SetWindowDisplayAffinity.argtypes = (ctypes.wintypes.HWND, ctypes.wintypes.DWORD)
+    user32.SetWindowDisplayAffinity.restype = ctypes.wintypes.BOOL
+    user32.GetAncestor.argtypes = (ctypes.wintypes.HWND, ctypes.wintypes.UINT)
+    user32.GetAncestor.restype = ctypes.wintypes.HWND
+    user32.IsWindow.argtypes = (ctypes.wintypes.HWND,)
+    user32.IsWindow.restype = ctypes.wintypes.BOOL
+    _get_long_ptr = getattr(user32, "GetWindowLongPtrW", user32.GetWindowLongW)
+    _set_long_ptr = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
+    _get_long_ptr.argtypes = (ctypes.wintypes.HWND, ctypes.wintypes.INT)
+    _get_long_ptr.restype = ctypes.c_longlong
+    _set_long_ptr.argtypes = (ctypes.wintypes.HWND, ctypes.wintypes.INT, ctypes.c_longlong)
+    _set_long_ptr.restype = ctypes.c_longlong
+    user32.SetWindowPos.argtypes = (
+        ctypes.wintypes.HWND,
+        ctypes.wintypes.HWND,
+        ctypes.wintypes.INT,
+        ctypes.wintypes.INT,
+        ctypes.wintypes.INT,
+        ctypes.wintypes.INT,
+        ctypes.wintypes.UINT,
+    )
+    user32.SetWindowPos.restype = ctypes.wintypes.BOOL
+    user32.ShowWindow.argtypes = (ctypes.wintypes.HWND, ctypes.wintypes.INT)
+    user32.ShowWindow.restype = ctypes.wintypes.BOOL
+    user32.SetForegroundWindow.argtypes = (ctypes.wintypes.HWND,)
+    user32.SetForegroundWindow.restype = ctypes.wintypes.BOOL
+else:
+    _get_long_ptr = None
+    _set_long_ptr = None
+
+
+def _image_to_png_bytes(image: Image.Image) -> bytes:
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def call_server(image: Image.Image, prompt: str = "") -> dict:
+    img_b64 = base64.b64encode(_image_to_png_bytes(image)).decode("utf-8")
+
+    payload = {
+        "prompt": prompt,  # "" allowed
+        "image": {
+            "data": img_b64,
+            "mime_type": "image/png",
+        },
+        "enable_google_search": "False"
+    }
+
+    r = requests.post(
+        SERVER_URL,
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": API_KEY,
+            "x-access-key": _CREDS.get("ACCESS_KEY", ""),
+            "x-version": _app_version,
+        },
+        json=payload,
+        timeout=30,
+    )
+
+    r.raise_for_status()
+    return r.json()
+
+
+def call_ai_google_search(image: Image.Image, prompt: str = "") -> dict:
+    img_b64 = base64.b64encode(_image_to_png_bytes(image)).decode("utf-8")
+
+    payload = {
+        "prompt": prompt,  # "" allowed
+        "image": {
+            "data": img_b64,
+            "mime_type": "image/png",
+        },
+        "enable_google_search": "True"
+    }
+
+    r = requests.post(
+        SERVER_URL,
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": API_KEY,
+            "x-access-key": _CREDS.get("ACCESS_KEY", ""),
+            "x-version": _app_version,
+        },
+        json=payload,
+        timeout=30,
+    )
+
+    r.raise_for_status()
+    return r.json()
+
+
+@dataclass(frozen=True)
+class BBox:
+    x: int
+    y: int
+    w: int
+    h: int
+
+    def normalized(self) -> "BBox":
+        return BBox(int(self.x), int(self.y), max(int(self.w), 0), max(int(self.h), 0))
+
+    def clamp_point(self, x: int, y: int) -> tuple[int, int]:
+        b = self.normalized()
+        min_x = b.x
+        min_y = b.y
+        max_x = b.x + max(b.w - 1, 0)
+        max_y = b.y + max(b.h - 1, 0)
+        return (max(min_x, min(x, max_x)), max(min_y, min(y, max_y)))
+
+
+def pick_point_in_bbox(bbox: BBox, *, rule: str = "random", margin: int = 2) -> tuple[int, int]:
+    b = bbox.normalized()
+    if b.w <= 0 or b.h <= 0:
+        raise ValueError(f"bbox is empty: {bbox}")
+
+    margin = max(int(margin), 0)
+    inner_left = b.x + min(margin, max(b.w - 1, 0))
+    inner_top = b.y + min(margin, max(b.h - 1, 0))
+    inner_right = b.x + max(b.w - 1 - margin, 0)
+    inner_bottom = b.y + max(b.h - 1 - margin, 0)
+
+    if inner_right < inner_left:
+        inner_left = inner_right = b.x + max(b.w // 2, 0)
+    if inner_bottom < inner_top:
+        inner_top = inner_bottom = b.y + max(b.h // 2, 0)
+
+    rule_norm = (rule or "").strip().lower().replace("_", "-")
+    if rule_norm in ("random", "rand"):
+        x = random.randint(inner_left, inner_right)
+        y = random.randint(inner_top, inner_bottom)
+        return b.clamp_point(x, y)
+    if rule_norm in ("left-middle", "leftmid", "left-mid", "left-middle-side"):
+        x = inner_left
+        y = b.y + max(b.h // 2, 0)
+        return b.clamp_point(x, y)
+
+    raise ValueError(f"Unknown rule: {rule!r}")
+
+
+def take_screenshot_windows() -> Image.Image:
+    return ImageGrab.grab(all_screens=True)
+
+def maybe_save_screenshot(image: Image.Image, *, enabled: bool) -> str | None:
+    if not enabled:
+        return None
+    os.makedirs("img", exist_ok=True)
+    filename = f"screenshot_{time.strftime('%Y%m%d_%H%M%S')}.png"
+    path = os.path.abspath(os.path.join("img", filename))
+    image.save(path, "PNG")
+    return path
+
+
+def maybe_ocr_visualize_path(*, enabled: bool) -> str | None:
+    if not enabled:
+        return None
+    os.makedirs("img", exist_ok=True)
+    filename = f"ocr_{time.strftime('%Y%m%d_%H%M%S')}.png"
+    return os.path.abspath(os.path.join("img", filename))
+
+_MOUSE = mouse.Controller()
+
+_UI_STATE: dict | None = None
+
+
+def _set_capture_exclusion(hwnd: int, hide: bool = True) -> None:
+    if not user32:
+        return
+    hwnd = user32.GetAncestor(hwnd, GA_ROOT)
+    if not user32.IsWindow(hwnd):
+        return
+    affinity = WDA_EXCLUDEFROMCAPTURE if hide else WDA_NONE
+    user32.SetWindowDisplayAffinity(hwnd, affinity)
+
+
+def _set_taskbar_visibility(hwnd: int, hide: bool = True) -> None:
+    if not user32 or _get_long_ptr is None or _set_long_ptr is None:
+        return
+    hwnd = user32.GetAncestor(hwnd, GA_ROOT)
+    if not user32.IsWindow(hwnd):
+        return
+    style = _get_long_ptr(hwnd, GWL_EXSTYLE)
+    if hide:
+        style |= WS_EX_TOOLWINDOW
+        style &= ~WS_EX_APPWINDOW
+    else:
+        style |= WS_EX_APPWINDOW
+        style &= ~WS_EX_TOOLWINDOW
+    _set_long_ptr(hwnd, GWL_EXSTYLE, style)
+    user32.SetWindowPos(
+        hwnd,
+        None,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+    )
+
+
+def _show_window(root: tk.Tk) -> None:
+    root.deiconify()
+    try:
+        root.attributes("-topmost", True)
+    except tk.TclError:
+        pass
+    root.lift()
+    root.focus_force()
+    if user32:
+        user32.ShowWindow(root.winfo_id(), SW_SHOW)
+        user32.SetForegroundWindow(root.winfo_id())
+    try:
+        root.attributes("-topmost", False)
+    except tk.TclError:
+        pass
+
+
+def _hide_window(root: tk.Tk) -> None:
+    if user32:
+        user32.ShowWindow(root.winfo_id(), SW_HIDE)
+    root.withdraw()
+
+
+def _init_ui(
+    history_max: int,
+    transparency: float,
+    window_size: object,
+    background_color: str,
+    border_color: str,
+    border_thickness: int,
+    header_visible: bool,
+    logs_size: int,
+    logs_text_color: str,
+    hint_visible: bool,
+    hint_color: str,
+    hint_size: int,
+    *,
+    start_hidden: bool,
+) -> None:
+    global _UI_STATE
+    root = tk.Tk()
+    root.title("AI window")
+    if isinstance(window_size, (list, tuple)) and len(window_size) == 2:
+        try:
+            w = max(int(window_size[0]), 200)
+            h = max(int(window_size[1]), 120)
+            root.geometry(f"{w}x{h}")
+        except (TypeError, ValueError):
+            root.geometry("420x260")
+    else:
+        root.geometry("420x260")
+    root.configure(bg=background_color)
+    if not header_visible:
+        try:
+            root.overrideredirect(True)
+        except tk.TclError:
+            pass
+    try:
+        root.attributes("-alpha", max(0.1, min(float(transparency), 1.0)))
+    except (tk.TclError, ValueError, TypeError):
+        pass
+
+    if start_hidden:
+        root.withdraw()
+
+    border_thickness = max(int(border_thickness), 0)
+    list_frame = tk.Frame(
+        root,
+        bg=border_color,
+        highlightthickness=0,
+        bd=0,
+    )
+    list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
+
+    listbox = tk.Listbox(
+        list_frame,
+        font=("Segoe UI", max(int(logs_size), 8)),
+        bg=background_color,
+        fg=logs_text_color,
+        highlightthickness=0,
+        bd=0,
+        selectbackground=border_color,
+        activestyle="none",
+    )
+    listbox.pack(fill=tk.BOTH, expand=True, padx=border_thickness, pady=border_thickness)
+
+    if hint_visible:
+        hint_frame = tk.Frame(root, bg=background_color)
+        hint_frame.pack(fill=tk.X, padx=10, pady=(0, 6))
+        hint_label = tk.Label(
+            hint_frame,
+            text="k: hide/unhide | l: lock | p: ai clicks | o: ai copies | i: ai log",
+            font=("Segoe UI", max(int(hint_size), 7)),
+            bg=background_color,
+            fg=hint_color,
+            anchor="e",
+            justify="right",
+        )
+        hint_label.pack(fill=tk.X)
+
+    root.update()
+    _set_capture_exclusion(root.winfo_id(), hide=True)
+    _set_taskbar_visibility(root.winfo_id(), hide=True)
+
+    _UI_STATE = {
+        "root": root,
+        "listbox": listbox,
+        "history": [],
+        "history_max": max(int(history_max), 1),
+        "action_log": True,
+    }
+
+
+def _move_window_to_cursor(root: tk.Tk, *, offset_x: int = 0, offset_y: int = 0) -> None:
+    try:
+        x = root.winfo_pointerx()
+        y = root.winfo_pointery()
+        width = root.winfo_width()
+        height = root.winfo_height()
+        left = max(0, x - (width // 2) + int(offset_x))
+        top = max(0, y - (height // 2) + int(offset_y))
+        root.geometry(f"+{left}+{top}")
+    except tk.TclError:
+        pass
+
+
+def _apply_window_pos(root: tk.Tk, value: object) -> None:
+    if isinstance(value, str):
+        mode = value.strip().lower()
+        if mode == "mouse":
+            _move_window_to_cursor(root)
+            return
+        match = re.match(r"^mouse\s*([+-])\s*\(\s*(-?\d+)\s*,\s*(-?\d+)\s*\)$", mode)
+        if match:
+            sign, raw_x, raw_y = match.groups()
+            ox = int(raw_x)
+            oy = int(raw_y)
+            if sign == "-":
+                ox = -ox
+                oy = -oy
+            _move_window_to_cursor(root, offset_x=ox, offset_y=oy)
+        return
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        try:
+            x = int(value[0])
+            y = int(value[1])
+            root.geometry(f"+{x}+{y}")
+        except (TypeError, ValueError, tk.TclError):
+            pass
+
+
+def click_bbox_windows(
+    bbox: tuple[int, int, int, int] | list[int] | BBox,
+    *,
+    rule: str = "random",
+    margin: int = 2,
+    smooth: bool = True,
+    move_duration: float = 0.08,
+    move_steps: int = 10,
+    move_speed: float = 0.0,
+    curve_strength: float = 0.0,
+    path_mode: str = "direct",
+    jitter: float = 0.0,
+) -> tuple[int, int]:
+    if not isinstance(bbox, BBox):
+        bbox = BBox(int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]))
+    x, y = pick_point_in_bbox(bbox, rule=rule, margin=margin)
+    if smooth:
+        move_cursor_smooth(
+            x=x,
+            y=y,
+            duration=move_duration,
+            steps=move_steps,
+            speed=move_speed,
+            curve_strength=curve_strength,
+            path_mode=path_mode,
+            jitter=jitter,
+        )
+        if tuple(map(int, _MOUSE.position)) != (int(x), int(y)):
+            _MOUSE.position = (x, y)
+    else:
+        _MOUSE.position = (x, y)
+    _MOUSE.click(mouse.Button.left, 1)
+    return (x, y)
+
+
+def copy_to_clipboard_windows(text: str) -> None:
+    subprocess.run(["clip"], input=text.encode("utf-8"), check=True)
+
+
+def bbox_for_contains(ocr_results: list[dict], needle: str, strict: bool = False) -> tuple[int, int, int, int] | None:
     n = needle.strip().lower()
     for idx, item in enumerate(ocr_results):
-            ###########################
         if strict:
-                n_items = len(ocr_results)
-                l=[]
-                for a in range(idx+1, min(idx+4,n_items)):
-                        l.append(ocr_results[a]['text'].strip().lower())
-                combined = " ".join(l)
-                print("Combined text:", combined, flush=True)
-                if n in combined:
-                        print("Found in combined text", flush=True)
-                        return ocr_results[idx+3]['bbox']
-                ###############################
+            n_items = len(ocr_results)
+            combined_items: list[str] = []
+            for a in range(idx + 1, min(idx + 4, n_items)):
+                combined_items.append(ocr_results[a]["text"].strip().lower())
+            combined = " ".join(combined_items)
+            print("Combined text:", combined, flush=True)
+            if n in combined and (idx + 3) < n_items:
+                # print("Found in combined text", flush=True)
+                return ocr_results[idx + 3]["bbox"]
         if n in item["text"].lower():
             return item["bbox"]
     return None
 
-def find_answer():
-        take_screenshot2(directory="img")
-        print("screenshot taken", flush=True)
-        ocr_results = ocr(image_path="./img/screenshot.png", mode="chunk", visualize=True, x_thresh=20, y_thresh=4)
-        model_response = generate(image_path="./img/screenshot.png", prompt="")
-        model_response = json.loads(model_response)
-        print("Model response:", model_response, flush=True)
-        print(type(model_response), flush=True)
-        for i in model_response["Correct option"]:
-                bbox = bbox_for_contains(ocr_results, i)
-                if bbox is None:
-                        print(f"Could not find bbox for answer option: {i!r}", file=sys.stderr)
-                        print("Trying next option...")
-                        bbox = bbox_for_contains(ocr_results, i, strict=True)
-                        if bbox is None:
-                                print(f"Could not find bbox for answer option on second try, skipping: {i!r}", file=sys.stderr)
-                                continue
-                print(f"Clicking answer option: {i!r} at bbox: {bbox}")
-                click_bbox(bbox, rule="random", backend="uinput", 
-                           move_duration=0.2, move_steps=15)
-                
-        print("\n\nFull response:\n", model_response["Correct option"])
-        # try:
-        #         session_env = {
-        #                 "WAYLAND_DISPLAY": os.environ.get("WAYLAND_DISPLAY", ""),
-        #                 "XDG_RUNTIME_DIR": os.environ.get("XDG_RUNTIME_DIR", ""),
-        #                 "XDG_SESSION_TYPE": os.environ.get("XDG_SESSION_TYPE", ""),
-        #                 "DISPLAY": os.environ.get("DISPLAY", ""),
-        #                 "XAUTHORITY": os.environ.get("XAUTHORITY", ""),
-        #         }
-        #         path = take_fullscreen_screenshot(directory="img", session_env=session_env)
-        #         print(f"screenshot taken: {path}")
-        # except Exception as e:
-        #         print(f"Failed to take screenshot on 'p': {e}", file=sys.stderr)
-        #         print(
-        #                 "Hint: if you're running with sudo for --global, sudo often strips GUI/session env. "
-        #                 "Try `sudo -E` (or pass DISPLAY/WAYLAND_DISPLAY/XDG_RUNTIME_DIR/XAUTHORITY) and ensure dependencies exist: "
-        #                 "Wayland->`grim`, X11->`pip install mss`.",
-        #                 file=sys.stderr,
-        #         )
-        #         return
 
-def ans_cp():
-        take_screenshot2(directory="img")
-        print("screenshot taken", flush=True)
-        model_response = generate(image_path="./img/screenshot.png", prompt="Give answer to given question with details. Respond in JSON format like {\"Correct option\": \"<answer>\"}")
-        model_response = json.loadso(model_response)
-        print("Model response:", model_response, flush=True)
-        for i in model_response["Correct option"]:
-                copy_to_clipboard(i)
-        print("\n\nFull response copied to clipboard:\n")
-        
-def _by_id_keyboard_event_paths() -> list[str]:
-        paths: list[str] = []
-        for link in sorted(glob.glob("/dev/input/by-id/*kbd*")):
-                try:
-                        real = os.path.realpath(link)
-                        if real.startswith("/dev/input/") and os.path.exists(real):
-                                paths.append(real)
-                except Exception:
-                        continue
-        # De-duplicate while preserving order
-        seen: set[str] = set()
-        uniq: list[str] = []
-        for p in paths:
-                if p not in seen:
-                        uniq.append(p)
-                        seen.add(p)
-        return uniq
+def _normalize_correct_options(value: object) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(v) for v in value]
+    return [str(value)]
 
 
-def pick_keyboard_device() -> str:
-        """Pick a likely keyboard device path from /dev/input/event*."""
-        from evdev import InputDevice, ecodes, list_devices
+def find_answer(*, save_screenshot: bool) -> None:
+    mouse_cfg = _CONFIG.get("mouse", {})
+    ocr_cfg = _CONFIG.get("ocr", {})
+    screenshot = take_screenshot_windows()
+    crop_bbox = _normalize_crop_bbox(ocr_cfg.get("crop_bbox"))
+    crop_clamp = bool(ocr_cfg.get("crop_clamp", True))
+    cropped = _crop_image(screenshot, crop_bbox, clamp=crop_clamp) if crop_bbox else screenshot
+    print("screenshot taken (in memory)", flush=True)
+    saved_path = maybe_save_screenshot(cropped, enabled=save_screenshot)
+    if saved_path:
+        print(f"screenshot saved: {saved_path}", flush=True)
+    ocr_visualize_path = maybe_ocr_visualize_path(enabled=save_screenshot)
+    ocr_results = ocr(
+        image=screenshot,
+        crop_bbox=crop_bbox,
+        crop_clamp=crop_clamp,
+        mode=str(ocr_cfg.get("mode", "chunk")),
+        visualize=bool(ocr_visualize_path),
+        visualize_path=ocr_visualize_path or "./img/ocr_bboxes.png",
+        x_thresh=float(ocr_cfg.get("x_thresh", 20)),
+        y_thresh=float(ocr_cfg.get("y_thresh", 4)),
+        group_y_thresh=float(ocr_cfg.get("group_y_thresh", 35)),
+        config=ocr_cfg.get("config") or None,
+    )
+    if ocr_visualize_path:
+        print(f"ocr image saved: {ocr_visualize_path}", flush=True)
+    
+    try:
+        print("server response")
+        model_response = call_server(cropped, prompt="")
+    except Exception as e:
+        print(f"Error calling server: {e}", file=sys.stderr)
+        return    
 
-        def is_likely_virtual(name: str) -> bool:
-                n = (name or "").lower()
-                return any(s in n for s in ("ydotool", "virtual", "uinput", "dummy"))
-
-        # Best signal on most distros: stable by-id symlinks that include "kbd".
-        preferred = _by_id_keyboard_event_paths()
-        for path in preferred:
-                try:
-                        dev = InputDevice(path)
-                        if is_likely_virtual(dev.name or ""):
-                                continue
-                        caps = dev.capabilities().get(ecodes.EV_KEY, [])
-                        if ecodes.KEY_P in caps and ecodes.KEY_ENTER in caps:
-                                return path
-                except Exception:
-                        continue
-
-        # Fallback: scan all event devices and look for a device that can emit KEY_P.
-        candidates: list[str] = []
-        for path in list_devices():
-            try:
-                dev = InputDevice(path)
-                if is_likely_virtual(dev.name or ""):
-                        continue
-                caps = dev.capabilities().get(ecodes.EV_KEY, [])
-                if ecodes.KEY_P in caps and ecodes.KEY_ENTER in caps:
-                        return path
-                if "keyboard" in (dev.name or "").lower() and ecodes.KEY_P in caps:
-                        candidates.append(path)
-            except Exception:
+    options = _normalize_correct_options(model_response.get("Correct option"))
+    for option in options:
+        bbox = bbox_for_contains(ocr_results, option)
+        found = bbox is not None
+        if bbox is None:
+            print("Error. Trying next bbox option...", flush=True)
+            bbox = bbox_for_contains(ocr_results, option, strict=True)
+            if bbox is None:
+                print(
+                    f"Could not find bbox for answer option on second try, skipping: {option!r}",
+                    file=sys.stderr,
+                )
+                _log_result(f"Answer: {option} | OCR: not found")
                 continue
-
-        if candidates:
-                return candidates[0]
-
-        raise RuntimeError(
-                "No keyboard-like input device found. "
-                "Try: python print_on_press.py --list-devices  and pass the right one via --device /dev/input/eventX."
+            found = True
+        print(f"Clicking answer option: {option!r} at pos: {bbox}")
+        _log_result(f"Answer: {option} | OCR: {'found' if found else 'not found'}")
+        click_bbox_windows(
+            bbox,
+            rule="random",
+            margin=2,
+            smooth=bool(mouse_cfg.get("smooth", True)),
+            move_duration=_resolve_range(mouse_cfg.get("duration"), 0.08),
+            move_steps=_resolve_int_range(mouse_cfg.get("steps"), 10),
+            move_speed=_resolve_range(mouse_cfg.get("speed"), 0.0),
+            curve_strength=_resolve_range(mouse_cfg.get("curve_strength"), 0.0),
+            path_mode=str(mouse_cfg.get("path_mode", "direct")),
+            jitter=_resolve_range(mouse_cfg.get("jitter"), 0.0),
         )
 
-
-def list_input_devices() -> int:
-        """Print input devices and whether they look like a keyboard."""
-        try:
-                from evdev import InputDevice, ecodes, list_devices
-        except Exception as e:
-                print(f"Failed to import evdev: {e}", file=sys.stderr)
-                return 1
-
-        for path in list_devices():
-                try:
-                        dev = InputDevice(path)
-                        caps = dev.capabilities().get(ecodes.EV_KEY, [])
-                        has_p = ecodes.KEY_P in caps
-                        has_enter = ecodes.KEY_ENTER in caps
-                        looks_keyboard = has_p and has_enter
-                        print(f"{path}: {dev.name}  keyboard={looks_keyboard}")
-                except Exception as e:
-                        print(f"{path}: <error: {e}>")
-        return 0
+    print("\nFull response:\n", options)
+    print("\nPress 'p' anywhere (Ctrl+C to exit)...")
 
 
-def listen_terminal(*, debug: bool = False) -> int:
-        """Listen for keypresses on the current terminal (no sudo required).
+def ans_cp(*, save_screenshot: bool) -> None:
+    ocr_cfg = _CONFIG.get("ocr", {})
+    screenshot = take_screenshot_windows()
+    crop_bbox = _normalize_crop_bbox(ocr_cfg.get("crop_bbox"))
+    crop_clamp = bool(ocr_cfg.get("crop_clamp", True))
+    cropped = _crop_image(screenshot, crop_bbox, clamp=crop_clamp) if crop_bbox else screenshot
+    print("screenshot taken (in memory)", flush=True)
+    saved_path = maybe_save_screenshot(cropped, enabled=save_screenshot)
+    if saved_path:
+        print(f"screenshot saved: {saved_path}", flush=True)
+    ocr_visualize_path = maybe_ocr_visualize_path(enabled=save_screenshot)
+    _ = ocr(
+        image=screenshot,
+        crop_bbox=crop_bbox,
+        crop_clamp=crop_clamp,
+        mode=str(ocr_cfg.get("mode", "chunk")),
+        visualize=bool(ocr_visualize_path),
+        visualize_path=ocr_visualize_path or "./img/ocr_bboxes.png",
+        x_thresh=float(ocr_cfg.get("x_thresh", 20)),
+        y_thresh=float(ocr_cfg.get("y_thresh", 4)),
+        group_y_thresh=float(ocr_cfg.get("group_y_thresh", 35)),
+        config=ocr_cfg.get("config") or None,
+    )
+    if ocr_visualize_path:
+        print(f"ocr image saved: {ocr_visualize_path}", flush=True)
+    try:
+        model_response = call_server(
+            cropped,
+            prompt="Give answer to given question with details. Respond in JSON format like {\"Correct option\": \"<answer>\"}'",
+        )
+    except Exception as e:
+        print(f"Error calling server: {e}", file=sys.stderr)
+        return
+    print("Model response:", model_response, flush=True)
+    options = _normalize_correct_options(model_response.get("Correct option"))
+    for option in options:
+        copy_to_clipboard_windows(option)
+        _log_result(f"Copied answer: {option}")
+    print("\n\nFull response copied to clipboard:\n")
 
-        This only receives keys while the terminal window is focused.
-        """
-        if not sys.stdin.isatty():
-                print(
-                        "stdin is not a TTY, so this mode can't read keypresses. "
-                        "Run it from a real terminal (VS Code: Terminal panel), not the Debug Console.",
-                        file=sys.stderr,
-                )
-                return 2
 
-        fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
-
-        print("Listening for 'p' on this terminal (focus this terminal). Ctrl+C to exit...", flush=True)
-        try:
-                tty.setraw(fd)
-                while True:
-                        ch = sys.stdin.read(1)
-                        if not ch:
-                                return 0
-                        if debug:
-                                print(f"got: {ch!r} (ord={ord(ch)})", flush=True)
-                        if ch in ("p", "P"):
-                                find_answer()
-                                print("p is pressed", flush=True)
-                        if ch in ("o", "O"):
-                                ans_cp()
-                                print(f"{ch} is pressed", flush=True)
-        except KeyboardInterrupt:
-                return 0
-        finally:
-                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+def ai_log_only(*, save_screenshot: bool) -> None:
+    ocr_cfg = _CONFIG.get("ocr", {})
+    screenshot = take_screenshot_windows()
+    crop_bbox = _normalize_crop_bbox(ocr_cfg.get("crop_bbox"))
+    crop_clamp = bool(ocr_cfg.get("crop_clamp", True))
+    cropped = _crop_image(screenshot, crop_bbox, clamp=crop_clamp) if crop_bbox else screenshot
+    try:
+        model_response = call_ai_google_search(cropped, prompt="")
+    except Exception as e:
+        print(f"Error calling server: {e}", file=sys.stderr)
+        _log_result(f"AI log error: {e}")
+        return
+    _log_result(f"Correct option: {model_response.get('Correct option')}")
 
 
-def listen_global(device: str | None) -> int:
-        """Listen for keypresses globally via /dev/input (may require sudo)."""
-        from evdev import InputDevice, ecodes
+def _log_result(message: str) -> None:
+    if not _UI_STATE:
+        return
+    root = _UI_STATE["root"]
+    listbox = _UI_STATE["listbox"]
+    history = _UI_STATE["history"]
+    max_len = _UI_STATE["history_max"]
 
-        try:
-                device_path = device or pick_keyboard_device()
-                dev = InputDevice(device_path)
-        except PermissionError:
-                print(
-                        "Permission denied opening input device. Try: sudo python print_on_press.py --global",
-                        file=sys.stderr,
-                )
-                return 1
-        except Exception as e:
-                print(f"Failed to open input device: {e}", file=sys.stderr)
-                return 1
+    history.append(message)
+    if len(history) > max_len:
+        del history[: len(history) - max_len]
 
-        print(f"Listening globally on: {dev.path} ({dev.name})")
-        print("Press 'p' anywhere (Ctrl+C to exit)...")
+    def _refresh() -> None:
+        listbox.delete(0, tk.END)
+        for item in history:
+            listbox.insert(tk.END, item)
 
-        try:
-                for event in dev.read_loop():
-                        if event.type == ecodes.EV_KEY and event.value == 1 and event.code == ecodes.KEY_P:
-                                print("p is pressed", flush=True)
-                                find_answer()
-                        if event.type == ecodes.EV_KEY and event.value == 1 and event.code == ecodes.KEY_O:
-                                print("o is pressed", flush=True)
-                                ans_cp()
-        except KeyboardInterrupt:
-                pass
+    root.after(0, _refresh)
 
-        return 0
+
+def listen_global(
+    *,
+    debug: bool = False,
+    save_screenshot: bool = False,
+    on_toggle=None,
+    on_window_toggle=None,
+    on_exit=None,
+) -> keyboard.Listener:
+    hotkeys_cfg = _CONFIG.get("hotkeys", {})
+    answer_key = str(hotkeys_cfg.get("answer_key", "p")).strip().lower()[:1] or "p"
+    copy_key = str(hotkeys_cfg.get("copy_key", "o")).strip().lower()[:1] or "o"
+    info_key = str(hotkeys_cfg.get("info_key", "i")).strip().lower()[:1] or "i"
+    if answer_key == copy_key:
+        copy_key = "o" if answer_key != "o" else "p"
+    toggle_key = str(hotkeys_cfg.get("toggle_commands", "l")).strip().lower()[:1] or "l"
+    if toggle_key in (answer_key, copy_key, info_key):
+        toggle_key = "l"
+    window_key = str(hotkeys_cfg.get("window_visibility", "k")).strip().lower()[:1] or "k"
+    if window_key in (answer_key, copy_key, info_key):
+        window_key = "k"
+    if info_key in (answer_key, copy_key, toggle_key, window_key):
+        info_key = "i"
+    commands_enabled = bool(hotkeys_cfg.get("turned_on_by_default", False))
+    window_visible = bool(hotkeys_cfg.get("visible_by_default", True))
+    busy_lock = threading.Lock()
+    busy = {"value": False}
+
+    def _try_run_task(func) -> bool:
+        with busy_lock:
+            if busy["value"]:
+                return False
+            busy["value"] = True
+
+        def _worker() -> None:
+            try:
+                func()
+            finally:
+                with busy_lock:
+                    busy["value"] = False
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return True
+
+    def on_press(key: keyboard.Key | keyboard.KeyCode) -> bool | None:
+        try: ch = key.char
+        except AttributeError: return
+        if ch is None:
+            return
+
+        if debug: print(f"got: {ch!r}", flush=True)
+        ch_low = ch.lower()
+        nonlocal commands_enabled, window_visible
+        if ch_low == toggle_key:
+            commands_enabled = not commands_enabled
+            state = "enabled" if commands_enabled else "disabled"
+            print(f"commands {state}", flush=True)
+            if on_toggle:
+                on_toggle(commands_enabled)
+            return
+        if ch_low == window_key:
+            if not commands_enabled:
+                return
+            window_visible = not window_visible
+            if on_window_toggle:
+                on_window_toggle(window_visible)
+            return
+        if not commands_enabled:
+            return
+        if ch_low == answer_key:
+            print(f"{answer_key} is pressed", flush=True)
+            if _try_run_task(lambda: find_answer(save_screenshot=save_screenshot)):
+                if _UI_STATE and _UI_STATE.get("action_log", True):
+                    _log_result(f"{answer_key} is pressed")
+        elif ch_low == copy_key:
+            print(f"{copy_key} is pressed", flush=True)
+            if _try_run_task(lambda: ans_cp(save_screenshot=save_screenshot)):
+                if _UI_STATE and _UI_STATE.get("action_log", True):
+                    _log_result(f"{copy_key} is pressed")
+        elif ch_low == info_key:
+            print(f"{info_key} is pressed", flush=True)
+            if _try_run_task(lambda: ai_log_only(save_screenshot=save_screenshot)):
+                if _UI_STATE and _UI_STATE.get("action_log", True):
+                    _log_result(f"{info_key} is pressed")
+        elif ch == "\x11":
+            print("Ctrl+Q pressed, exiting...", flush=True)
+            if on_exit:
+                on_exit()
+            return False
+
+    print(f"Listening globally for toggle '{toggle_key}' (Ctrl+C to exit)...", flush=True)
+    listener = keyboard.Listener(on_press=on_press)
+    listener.start()
+    return listener
 
 
 def main() -> int:
-        parser = argparse.ArgumentParser(
-                description=(
-                        "Print 'p is pressed' whenever you press the p key. "
-                        "By default listens only in this terminal; use --global for system-wide listening."
-                )
-        )
-        parser.add_argument(
-                "--global",
-                dest="global_listen",
-                action="store_true",
-                help="Listen globally via /dev/input (may require sudo).",
-        )
-        parser.add_argument(
-                "--debug",
-                action="store_true",
-                help="Print every character received (terminal mode only).",
-        )
-        parser.add_argument(
-                "--device",
-                help="Input device path (e.g. /dev/input/event3). If omitted, a keyboard is auto-selected.",
-        )
-        parser.add_argument(
-                "--list-devices",
-                action="store_true",
-                help="List /dev/input/event* devices (useful with --global).",
-        )
-        args = parser.parse_args()
-
-        if args.list_devices:
-                return list_input_devices()
-
-        if args.global_listen:
-                return listen_global(args.device)
-        return listen_terminal(debug=args.debug)
+    warmup_tesseract()
+    ui_cfg = _CONFIG.get("ui", {})
+    start_visible = bool(_CONFIG.get("hotkeys", {}).get("visible_by_default", True))
+    _init_ui(
+        int(ui_cfg.get("logs", {}).get("history_max", 10)),
+        float(ui_cfg.get("transparency", 1.0)),
+        ui_cfg.get("window_size", [420, 260]),
+        str(ui_cfg.get("background_color", "#111111")),
+        str(ui_cfg.get("border_color", "#2a2a2a")),
+        int(ui_cfg.get("border_thickness", 2)),
+        bool(ui_cfg.get("header_visible", True)),
+        int(ui_cfg.get("logs", {}).get("size", 11)),
+        str(ui_cfg.get("logs", {}).get("text_color", "#ffffff")),
+        bool(ui_cfg.get("hint", {}).get("visible", True)),
+        str(ui_cfg.get("hint", {}).get("color", "#888888")),
+        int(ui_cfg.get("hint", {}).get("size", 9)),
+        start_hidden=not start_visible,
+    )
+    _UI_STATE["action_log"] = bool(ui_cfg.get("logs", {}).get("action_log", True))
+    root = _UI_STATE["root"]
+    _apply_window_pos(root, ui_cfg.get("window_pos", "mouse"))
+    if start_visible:
+        _show_window(root)
+    else:
+        _hide_window(root)
+    parser = argparse.ArgumentParser(
+        description="Windows: listen for global key presses. Press 'p' for answers, 'o' to copy.",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print every character received.",
+    )
+    parser.add_argument(
+        "--save-screenshot",
+        action="store_true",
+        help="Save screenshots to ./img for debugging.",
+    )
+    args = parser.parse_args()
+    listener = listen_global(
+        debug=args.debug,
+        save_screenshot=args.save_screenshot,
+        on_toggle=None,
+        on_window_toggle=lambda visible: (_apply_window_pos(root, ui_cfg.get("window_pos", "mouse")), _show_window(root)) if visible else _hide_window(root),
+        on_exit=lambda: root.after(0, root.quit),
+    )
+    try:
+        root.mainloop()
+    finally:
+        if listener:
+            listener.stop()
+    return 0
 
 
 if __name__ == "__main__":
-        raise SystemExit(main())
-    
-    
-    
-    
+    raise SystemExit(main())

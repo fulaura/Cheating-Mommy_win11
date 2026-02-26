@@ -1,1 +1,0 @@
-source ~/venvs/data-science/bin/activate && sudo env "PATH=$PATH" python main.py --global --device /dev/input/event3

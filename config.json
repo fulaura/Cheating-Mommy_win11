@@ -1,0 +1,49 @@
+{
+  "mouse": {
+    "smooth": true,
+    "duration": [0.18, 0.25],
+    "steps": [20, 80],
+    "curve_strength": [20, 80],
+    "speed": 0,
+    "path_mode": "indirect",
+    "jitter": [0, 5]
+  },
+  "ocr": {
+    "config": "",
+    "mode": "chunk",
+    "x_thresh": 20,
+    "y_thresh": 4,
+    "group_y_thresh": 35,
+    "crop_bbox": [],
+    "crop_clamp": true
+  },
+  "hotkeys": {
+    "toggle_commands": "l",
+    "window_visibility": "k",
+    "turned_on_by_default": true,
+    "visible_by_default": false,
+    "answer_key": "p",
+    "copy_key": "o",
+    "info_key": "i"
+  },
+  "ui": {
+    "window_pos": "mouse-(200, -160)",
+    "window_size": [420, 260],
+    "transparency": 1.0,
+    "background_color": "#ffffff",
+    "border_color": "#ffffff",
+    "border_thickness": 2,
+    "header_visible": false,
+    "logs": {
+      "history_max": 10,
+      "size": 11,
+      "text_color": "#000000",
+      "action_log": true
+    },
+    "hint": {
+      "visible": true,
+      "color": "#111111",
+      "size": 9
+    }
+  }
+}

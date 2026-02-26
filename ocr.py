@@ -1,12 +1,68 @@
 from collections import defaultdict, deque
 from pathlib import Path
+import os
+import sys
 import pytesseract
 from PIL import Image, ImageDraw
 
 
+def _configure_tesseract() -> None:
+    appdata = os.environ.get("APPDATA") or os.environ.get("LOCALAPPDATA")
+    app_name = "Cheating Mommy"
+    data_dir_candidates: list[str] = []
+
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        base_dir = sys._MEIPASS
+    install_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+    data_hint_path = os.path.join(install_dir, "data_dir.txt")
+    if os.path.isfile(data_hint_path):
+        try:
+            with open(data_hint_path, "r", encoding="utf-8") as f:
+                hinted_dir = f.read().strip()
+            if hinted_dir:
+                data_dir_candidates.append(hinted_dir)
+        except OSError:
+            pass
+
+    if appdata:
+        data_dir_candidates.append(os.path.join(appdata, app_name))
+
+    for data_dir in data_dir_candidates:
+        app_tess = os.path.join(data_dir, "tesseract")
+        app_exe = os.path.join(app_tess, "tesseract.exe")
+        if os.path.isfile(app_exe):
+            pytesseract.pytesseract.tesseract_cmd = app_exe
+            tessdata = os.path.join(app_tess, "tessdata")
+            if os.path.isdir(tessdata):
+                os.environ.setdefault("TESSDATA_PREFIX", tessdata)
+            return
+
+    tesseract_dir = os.path.join(base_dir, "tesseract")
+    tesseract_exe = os.path.join(tesseract_dir, "tesseract.exe")
+    if os.path.isfile(tesseract_exe):
+        pytesseract.pytesseract.tesseract_cmd = tesseract_exe
+        tessdata = os.path.join(tesseract_dir, "tessdata")
+        if os.path.isdir(tessdata):
+            os.environ.setdefault("TESSDATA_PREFIX", tessdata)
+
+
+_configure_tesseract()
+
+
+def warmup_tesseract() -> None:
+    """Trigger a one-time Tesseract call to avoid first-use popup during OCR."""
+    try:
+        _ = pytesseract.get_tesseract_version()
+    except Exception:
+        pass
+
+
 def ocr(
     image_path: str = "./img/screenshot.png",
+    image: Image.Image | None = None,
     *,
+    config: str | None = None,
     crop_bbox: tuple[int, int, int, int] | None = None,
     crop_clamp: bool = True,
     mode: str = "chunk",  # "line" or "chunk"
@@ -27,7 +83,7 @@ def ocr(
             "group_id": 1
         }
     """
-    original_image = Image.open(image_path)
+    original_image = image or Image.open(image_path)
 
     offset_x = 0
     offset_y = 0
@@ -50,7 +106,10 @@ def ocr(
         offset_y = top
         image = original_image.crop((left, top, right, bottom))
 
-    data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
+    if config:
+        data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT, config=config)
+    else:
+        data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
 
     results = []
 
@@ -165,8 +224,8 @@ def ocr(
         print(f"Saved OCR bbox visualization to: {out_path}")
 
     # ---- Print results ----
-    for r in results:
-        print(f"G{r['group_id']}: {r['text']} //// \nBBOX: {r['bbox']} ////\n")
+    # for r in results:
+    #     print(f"G{r['group_id']}: {r['text']} //// \nBBOX: {r['bbox']} ////\n")
 
     return results
 

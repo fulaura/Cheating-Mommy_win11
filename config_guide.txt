@@ -1,0 +1,122 @@
+config.json reference
+
+mouse.smooth (bool)
+  Enable or disable smooth movement. If false, the cursor jumps to the target.
+
+mouse.duration (float, seconds)
+  Total time to move the cursor when speed is 0.0.
+  Can be a list [min, max] to randomize each move.
+
+mouse.steps (int)
+  Number of steps for smooth movement. Higher = smoother but slower.
+  Can be a list [min, max] to randomize each move.
+  A single-item list (e.g., [12]) is treated as a constant.
+
+mouse.curve_strength (float, pixels)
+  Amount of curve applied to the path. 0.0 is a straight line.
+  Positive values curve to one side; negative values curve to the other.
+  Can be a list [min, max] to randomize each move.
+
+mouse.speed (float, pixels per second)
+  If > 0, overrides duration. The move duration becomes distance / speed.
+  Can be a list [min, max] to randomize each move.
+  A single-item list (e.g., [500]) is treated as a constant.
+
+mouse.path_mode (string)
+  "direct" for straight paths, "indirect" to apply a curve.
+
+mouse.jitter (float, pixels)
+  Adds random jitter to intermediate points. 0 disables jitter.
+  Can be a list [min, max] to randomize each move.
+  A single-item list (e.g., [2]) is treated as a constant.
+
+ocr.config (string)
+  Optional Tesseract config string. Leave empty for defaults.
+  Example:
+  --oem 3 --psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789
+
+ocr.mode (string)
+  OCR aggregation mode. "chunk" or "line".
+
+ocr.x_thresh (float)
+  Horizontal gap threshold for merging in chunk mode.
+
+ocr.y_thresh (float)
+  Vertical gap threshold for merging in chunk mode.
+
+ocr.group_y_thresh (float)
+  Vertical gap to separate different question groups.
+
+ocr.crop_bbox (list)
+  Crop the screenshot before OCR/server calls as [x, y, w, h].
+  Use [] to disable cropping.
+
+ocr.crop_clamp (bool)
+  Clamp crop_bbox to the screenshot bounds if it goes out of range.
+
+hotkeys.toggle_commands (string)
+  Single key that toggles command hotkeys (p/o) on or off.
+  If set to "p" or "o", it falls back to "l".
+
+hotkeys.window_visibility (string)
+  Single key that toggles the AI window visibility.
+  If set to "p" or "o", it falls back to "k".
+
+hotkeys.turned_on_by_default (bool)
+  If true, p/o are enabled at startup. If false, toggle key enables them.
+
+hotkeys.visible_by_default (bool)
+  If true, the window is shown on startup. If false, it starts hidden.
+
+hotkeys.answer_key (string)
+  Key to trigger answer selection (default "p").
+
+hotkeys.copy_key (string)
+  Key to copy the answer (default "o").
+
+hotkeys.info_key (string)
+  Key to request AI log-only response (default "i").
+
+ui.window_pos (string or list)
+  "mouse" to show near the cursor, "default" to keep current position.
+  "mouse+(x,y)" or "mouse-(x,y)" to apply offset from mouse-centered position.
+  Or [x, y] to place the window at a fixed screen position.
+
+ui.window_size (list)
+  Window size as [width, height]. Minimum 200x120.
+
+ui.transparency (float)
+  Window opacity from 0.1 to 1.0.
+
+ui.background_color (string)
+  Window background color (hex like "#111111").
+
+ui.border_color (string)
+  Border color for the list area (hex like "#2a2a2a").
+
+ui.border_thickness (int)
+  Border thickness in pixels for the list area.
+
+ui.header_visible (bool)
+  Show or hide the window title bar.
+
+ui.logs.history_max (int)
+  Max number of entries to keep in the on-screen AI results list.
+
+ui.logs.size (int)
+  Log text size (minimum 8).
+
+ui.logs.text_color (string)
+  Log text color (hex like "#ffffff").
+
+ui.logs.action_log (bool)
+  If true, logs keypress actions like "p is pressed" and "o is pressed".
+
+ui.hint.visible (bool)
+  Show or hide the bottom hint text.
+
+ui.hint.color (string)
+  Hint text color (hex like "#888888").
+
+ui.hint.size (int)
+  Hint text size (minimum 7).

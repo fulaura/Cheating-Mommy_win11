@@ -1,4 +1,28 @@
-config.json reference
+AI & Credentials Reference (%APPDATA%\Cheating Mommy\credentials.txt):
+  (You can edit this file directly or run update_credentials.exe to modify settings interactively)
+
+SERVER_URL (string)
+  Server endpoint URL (e.g. "https://server-784947522852.europe-west1.run.app").
+  If set to "local" or left empty (""), it automatically switches to local AI mode!
+
+LLM (string)
+  "deepseek" or "gemini". Used when running locally.
+
+MODEL (string)
+  Optional model name override.
+  Defaults:
+  - DeepSeek: "deepseek-flash" (or custom like "deepseek-v4-pro")
+  - Gemini: "gemini-2.5-flash" (or "gemini-3-flash-preview")
+
+API (string)
+  API key for the chosen LLM (Gemini or DeepSeek) when running locally.
+  (DEEPSEEK_API_KEY and GEMINI_API_KEY are also supported).
+
+ACCESS_KEY / API_KEY (string)
+  Client keys used for authentication when connecting to the remote server.
+
+--------------------------------------------------------------------------------
+config.json reference (Application UI, Mouse, Hotkeys, OCR settings):
 
 mouse.smooth (bool)
   Enable or disable smooth movement. If false, the cursor jumps to the target.

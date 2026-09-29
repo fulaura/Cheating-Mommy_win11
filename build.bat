@@ -13,8 +13,8 @@ for /f "usebackq tokens=1,* delims==" %%A in ("app.txt") do (
     echo #define AppName "%APP_NAME%"
     echo #define AppVersion "%APP_VERSION%"
 ) > app_meta.iss
-call ".venv\Scripts\activate.bat"
-pyinstaller --onefile --noconsole --icon icon.ico --name "%APP_NAME%" --clean main.py
-pyinstaller --onefile --console  --icon icon.ico --name "%APP_NAME%_console" --clean main.py
+call "%~dp0.venv\Scripts\activate.bat"
+call "%~dp0.venv\Scripts\python.exe" -m PyInstaller --onefile --noconsole --icon icon.ico --name "%APP_NAME%" --clean main.py
+call "%~dp0.venv\Scripts\python.exe" -m PyInstaller --onefile --console  --icon icon.ico --name "%APP_NAME%_console" --clean main.py
 call "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "installer.iss"
-call deactivate
+

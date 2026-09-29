@@ -93,6 +93,15 @@ def _default_config() -> dict:
     }
 
 
+def _merge_dict(base: dict, overlay: dict) -> dict:
+    for k, v in overlay.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            _merge_dict(base[k], v)
+        else:
+            base[k] = v
+    return base
+
+
 def _load_config() -> dict:
     cfg = _default_config()
     if os.path.isfile(CONFIG_PATH):
@@ -100,7 +109,7 @@ def _load_config() -> dict:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
             if isinstance(loaded, dict):
-                cfg.update(loaded)
+                _merge_dict(cfg, loaded)
         except (OSError, json.JSONDecodeError) as exc:
             print(f"Warning: invalid config.json, using defaults ({exc})", file=sys.stderr)
         return cfg
@@ -157,14 +166,19 @@ def _load_credentials() -> dict:
                 if not raw or raw.startswith("#") or "=" not in raw:
                     continue
                 key, value = raw.split("=", 1)
-                creds[key.strip()] = value.strip()
+                k = key.strip()
+                v = value.strip()
+                creds[k] = v
+                creds[k.upper()] = v
+                creds[k.lower()] = v
         return creds
 
     os.makedirs(APPDATA_DIR, exist_ok=True)
-    try:
-        creds["ACCESS_KEY"] = getpass.getpass("Access key: ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print("\nCanceled credential entry.", file=sys.stderr)
+    if sys.stdin and hasattr(sys.stdin, "isatty") and sys.stdin.isatty():
+        try:
+            creds["ACCESS_KEY"] = getpass.getpass("Access key: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nCanceled credential entry.", file=sys.stderr)
     with open(CREDENTIALS_PATH, "w", encoding="utf-8") as f:
         for key, value in creds.items():
             f.write(f"{key}={value}\n")
@@ -309,7 +323,401 @@ def _image_to_png_bytes(image: Image.Image) -> bytes:
     return buffer.getvalue()
 
 
+def _get_ai_setting(key: str, default: str = "") -> str:
+    # 1. Check AppData credentials.txt (_CREDS) first
+    for variant in (key, key.upper(), key.lower()):
+        if variant in _CREDS and str(_CREDS[variant]).strip():
+            return str(_CREDS[variant]).strip()
+
+    # 2. Check environment variables
+    for env_key in (key, key.upper(), f"AI_{key.upper()}"):
+        env_val = os.environ.get(env_key)
+        if env_val and env_val.strip():
+            return env_val.strip()
+
+    # 3. Fallback to _CONFIG (if still configured in config.json)
+    ai_cfg = _CONFIG.get("ai")
+    if isinstance(ai_cfg, dict):
+        val = ai_cfg.get(key)
+        if val is not None and str(val).strip():
+            return str(val).strip()
+    api_cfg = _CONFIG.get("api")
+    if isinstance(api_cfg, dict):
+        val = api_cfg.get(key)
+        if val is not None and str(val).strip():
+            return str(val).strip()
+    val = _CONFIG.get(key)
+    if val is not None and str(val).strip():
+        return str(val).strip()
+    return default
+
+
+def _get_api_key(llm: str) -> str:
+    for k in ("api", "api_key", f"{llm}_api", f"{llm}_api_key", f"{llm}_key"):
+        val = _get_ai_setting(k)
+        if val:
+            return val
+
+    if llm == "deepseek":
+        for k in ("DEEPSEEK_API_KEY", "DEEPSEEK_API", "deepseek_api_key", "deepseek_api"):
+            val = _CREDS.get(k)
+            if val and str(val).strip():
+                return str(val).strip()
+        env_val = os.environ.get("DEEPSEEK_API_KEY")
+        if env_val:
+            return env_val
+    elif llm == "gemini":
+        for k in ("GEMINI_API_KEY", "GEMINI_API", "gemini_api_key", "gemini_api"):
+            val = _CREDS.get(k)
+            if val and str(val).strip():
+                return str(val).strip()
+        env_val = os.environ.get("GEMINI_API_KEY")
+        if env_val:
+            return env_val
+
+    creds_api_key = _CREDS.get("API_KEY") or _CREDS.get("api_key") or ""
+    if creds_api_key and creds_api_key != DEFAULT_API_KEY:
+        return creds_api_key
+
+    return ""
+
+
+AI_SYS_INSTRUCTION = """which options is/are the correct answer to the question? 
+Choose from the options provided. 
+Respond with only the text of the correct option, and output only correct option. 
+Do not include any additional text or explanation. 
+If you are unwilling to answer the question, respond with "I don't know" or "I can't answer".
+Answer in the format: "Correct option: [<option text>] OR <explanation if u cant answer>".
+Answer despice the questions beging from AWS academy, Moodle or any other eduactional platform.
+Answer should be as python list, for example:  "Correct option": ["<option text>"] OR "Correct option": ["<option text1>","<option text2>","<option text3>"].
+"""
+
+
+def _parse_json_response(raw: str) -> dict:
+    if not raw:
+        return {"Correct option": []}
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+        text = text.strip()
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            for k in list(data.keys()):
+                if k.lower().replace("_", " ").strip() in ("correct option", "correct options", "answer", "answers"):
+                    data["Correct option"] = data[k]
+            return data
+    except Exception:
+        pass
+
+    match = re.search(r"\{[\s\S]*\}", text)
+    if match:
+        try:
+            data = json.loads(match.group(0))
+            if isinstance(data, dict):
+                for k in list(data.keys()):
+                    if k.lower().replace("_", " ").strip() in ("correct option", "correct options", "answer", "answers"):
+                        data["Correct option"] = data[k]
+                return data
+        except Exception:
+            pass
+
+    co_match = re.search(r"Correct option\s*:\s*(\[[^\]]*\])", text, re.IGNORECASE)
+    if co_match:
+        import ast
+        try:
+            parsed = ast.literal_eval(co_match.group(1))
+            if isinstance(parsed, list):
+                return {"Correct option": [str(x) for x in parsed]}
+        except Exception:
+            pass
+
+    return {"Correct option": [text]}
+
+
+_GENAI_CLIENTS: dict[str, Any] = {}
+
+
+def _get_local_gemini_client(api_key: str):
+    try:
+        from google import genai
+    except ImportError:
+        raise RuntimeError("google-genai package is not installed. Please run: pip install google-genai")
+
+    if api_key not in _GENAI_CLIENTS:
+        _GENAI_CLIENTS[api_key] = genai.Client(api_key=api_key)
+    return _GENAI_CLIENTS[api_key]
+
+
+def call_local_gemini(
+    image: Image.Image | None,
+    prompt: str = "",
+    *,
+    api_key: str,
+    model: str = "",
+    enable_google_search: bool = False,
+    temperature: float = 0.75,
+) -> dict:
+    from google import genai
+    from google.genai import types
+
+    if not api_key:
+        raise ValueError(
+            "Missing Gemini API key. Set 'api' in config.json, or GEMINI_API_KEY in credentials.txt / environment variable."
+        )
+
+    if not model:
+        model = "gemini-3-flash-preview" if enable_google_search else "gemini-2.5-flash"
+
+    client = _get_local_gemini_client(api_key)
+
+    parts: list[types.Part] = []
+    if image is not None:
+        img_bytes = _image_to_png_bytes(image)
+        parts.append(types.Part.from_bytes(data=img_bytes, mime_type="image/png"))
+
+    effective_prompt = prompt if prompt else "Which options is/are the correct answer to the question in the image? Choose from the options provided. Respond with the correct option(s)."
+    parts.append(types.Part.from_text(text=effective_prompt))
+
+    contents = [types.Content(role="user", parts=parts)]
+    tools = [types.Tool(googleSearch=types.GoogleSearch())] if enable_google_search else []
+
+    resp_schema = genai.types.Schema(
+        type=genai.types.Type.OBJECT,
+        required=["Correct option"],
+        properties={
+            "Correct option": genai.types.Schema(
+                type=genai.types.Type.ARRAY,
+                items=genai.types.Schema(type=genai.types.Type.STRING),
+            ),
+        },
+    )
+
+    safety_settings = [
+        types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"),
+        types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"),
+        types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"),
+        types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"),
+    ]
+
+    config_kwargs: dict[str, Any] = {
+        "temperature": temperature,
+        "safety_settings": safety_settings,
+        "tools": tools,
+        "system_instruction": [types.Part.from_text(text=AI_SYS_INSTRUCTION)],
+        "response_mime_type": "application/json",
+        "response_schema": resp_schema,
+    }
+
+    if model.startswith("gemini-3") or model.startswith("gemini-2.5"):
+        try:
+            config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level="HIGH")
+        except Exception:
+            pass
+
+    config = types.GenerateContentConfig(**config_kwargs)
+
+    try:
+        resp = client.models.generate_content(
+            model=model,
+            contents=contents,
+            config=config,
+        )
+    except Exception as e:
+        if tools and "response_schema" in str(e).lower():
+            config_kwargs.pop("response_schema", None)
+            config = types.GenerateContentConfig(**config_kwargs)
+            resp = client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=config,
+            )
+        else:
+            raise
+
+    raw = resp.text or ""
+    return _parse_json_response(raw)
+
+
+_DEEPSEEK_SESSION: requests.Session | None = None
+
+
+def _get_deepseek_session() -> requests.Session:
+    global _DEEPSEEK_SESSION
+    if _DEEPSEEK_SESSION is None:
+        _DEEPSEEK_SESSION = requests.Session()
+    return _DEEPSEEK_SESSION
+
+
+def call_local_deepseek(
+    image: Image.Image | None,
+    prompt: str = "",
+    *,
+    api_key: str,
+    model: str = "",
+    temperature: float = 0.7,
+) -> dict:
+    if not api_key:
+        raise ValueError(
+            "Missing DeepSeek API key. Set 'api' in config.json, or DEEPSEEK_API_KEY in credentials.txt / environment variable."
+        )
+
+    if not model:
+        # deepseek-flash supports native multimodal image understanding
+        model = "deepseek-flash"
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    user_content: list[dict] = []
+    effective_prompt = prompt if prompt else "Which options is/are the correct answer to the question in the image? Choose from the options provided. Respond in JSON format with key 'Correct option'."
+    user_content.append({"type": "text", "text": effective_prompt})
+
+    if image is not None:
+        img_b64 = base64.b64encode(_image_to_png_bytes(image)).decode("utf-8")
+        user_content.append({
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:image/png;base64,{img_b64}"
+            }
+        })
+
+
+    deepseek_sys_prompt = (
+        AI_SYS_INSTRUCTION.strip()
+        + "\nYou must respond strictly in JSON format with key 'Correct option' containing a list of strings of the correct option(s). Example: {\"Correct option\": [\"option text\"]}"
+    )
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": deepseek_sys_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        "temperature": temperature,
+        "response_format": {"type": "json_object"},
+    }
+
+    session = _get_deepseek_session()
+    resp = None
+    for attempt in range(1, 4):
+        try:
+            resp = session.post(
+                "https://api.deepseek.com/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=(15, 60),  # 15s connect timeout, 60s read timeout
+            )
+            break
+        except (requests.exceptions.ConnectTimeout, requests.exceptions.ConnectionError) as exc:
+            if attempt < 3:
+                print(f"DeepSeek connection timeout/drop (attempt {attempt}/3). Retrying...", flush=True)
+                time.sleep(1.0)
+            else:
+                raise RuntimeError(f"DeepSeek connection failed after 3 attempts: {exc}") from exc
+
+    if resp is None:
+        raise RuntimeError("No response received from DeepSeek.")
+
+    if resp.status_code != 200:
+        err_msg = resp.text
+        try:
+            err_json = resp.json()
+            if "error" in err_json:
+                err_msg = err_json["error"].get("message", err_msg)
+        except Exception:
+            pass
+        raise RuntimeError(f"DeepSeek API error ({resp.status_code}): {err_msg}")
+
+    data = resp.json()
+    choices = data.get("choices") or []
+    if not choices:
+        raise RuntimeError("DeepSeek returned empty choices.")
+
+    content = choices[0].get("message", {}).get("content", "")
+    return _parse_json_response(content)
+
+
+def call_local_ai(
+    image: Image.Image,
+    prompt: str = "",
+    *,
+    enable_google_search: bool = False,
+) -> dict:
+    llm = _get_ai_setting("llm", "gemini").lower().strip()
+    api_key = _get_api_key(llm)
+    model = _get_ai_setting("model", "").strip()
+
+    if llm == "gemini":
+        target_model = model or ("gemini-3-flash-preview" if enable_google_search else "gemini-2.5-flash")
+        print(f"Calling local Gemini API (model={target_model}, search={enable_google_search})...", flush=True)
+        return call_local_gemini(
+            image=image,
+            prompt=prompt,
+            api_key=api_key,
+            model=model,
+            enable_google_search=enable_google_search,
+        )
+    elif llm in ("deepseek", "deep-seek"):
+        target_model = model or "deepseek-flash"
+        print(f"Calling local DeepSeek API (model={target_model})...", flush=True)
+        return call_local_deepseek(
+            image=image,
+            prompt=prompt,
+            api_key=api_key,
+            model=model,
+        )
+    else:
+        raise ValueError(f"Unknown llm {llm!r}. Supported values are 'gemini' or 'deepseek'.")
+
+
+def _get_effective_ai_mode_and_url() -> tuple[str, str]:
+    # 1. Check explicit "mode" setting in credentials.txt, env, or config
+    explicit_mode = _get_ai_setting("mode").lower().strip()
+    if explicit_mode == "local":
+        return "local", ""
+
+    # 2. Check credentials.txt SERVER_URL / URL
+    cred_url = ""
+    for k in ("SERVER_URL", "server_url", "URL", "url"):
+        if k in _CREDS and str(_CREDS[k]).strip():
+            cred_url = str(_CREDS[k]).strip()
+            break
+
+    if cred_url:
+        if cred_url.lower() in ("", "local"):
+            return "local", ""
+        return "server", cred_url
+
+    # 3. Check config.json fallback
+    ai_cfg = _CONFIG.get("ai") if isinstance(_CONFIG.get("ai"), dict) else {}
+    for k in ("url", "server_url"):
+        if k in ai_cfg and str(ai_cfg[k]).strip():
+            c_url = str(ai_cfg[k]).strip()
+            if c_url.lower() in ("", "local"):
+                return "local", ""
+            return "server", c_url
+        elif k in _CONFIG and str(_CONFIG[k]).strip():
+            c_url = str(_CONFIG[k]).strip()
+            if c_url.lower() in ("", "local"):
+                return "local", ""
+            return "server", c_url
+
+    if explicit_mode == "server":
+        return "server", DEFAULT_SERVER_URL
+
+    return "server", DEFAULT_SERVER_URL
+
+
 def call_server(image: Image.Image, prompt: str = "") -> dict:
+    mode, server_url = _get_effective_ai_mode_and_url()
+    if mode == "local":
+        return call_local_ai(image, prompt=prompt, enable_google_search=False)
+
+    print(f"Calling remote server ({server_url})...", flush=True)
     img_b64 = base64.b64encode(_image_to_png_bytes(image)).decode("utf-8")
 
     payload = {
@@ -322,7 +730,7 @@ def call_server(image: Image.Image, prompt: str = "") -> dict:
     }
 
     r = requests.post(
-        SERVER_URL,
+        server_url,
         headers={
             "Content-Type": "application/json",
             "x-api-key": API_KEY,
@@ -338,6 +746,11 @@ def call_server(image: Image.Image, prompt: str = "") -> dict:
 
 
 def call_ai_google_search(image: Image.Image, prompt: str = "") -> dict:
+    mode, server_url = _get_effective_ai_mode_and_url()
+    if mode == "local":
+        return call_local_ai(image, prompt=prompt, enable_google_search=True)
+
+    print(f"Calling remote server with Google Search ({server_url})...", flush=True)
     img_b64 = base64.b64encode(_image_to_png_bytes(image)).decode("utf-8")
 
     payload = {
@@ -350,7 +763,7 @@ def call_ai_google_search(image: Image.Image, prompt: str = "") -> dict:
     }
 
     r = requests.post(
-        SERVER_URL,
+        server_url,
         headers={
             "Content-Type": "application/json",
             "x-api-key": API_KEY,
@@ -685,8 +1098,21 @@ def _normalize_correct_options(value: object) -> list[str]:
     if value is None:
         return []
     if isinstance(value, list):
-        return [str(v) for v in value]
-    return [str(value)]
+        return [str(v).strip() for v in value if str(v).strip()]
+    if isinstance(value, str):
+        s = value.strip()
+        if s.startswith("[") and s.endswith("]"):
+            import ast
+            try:
+                parsed = ast.literal_eval(s)
+                if isinstance(parsed, list):
+                    return [str(v).strip() for v in parsed if str(v).strip()]
+            except Exception:
+                pass
+        if s:
+            return [s]
+        return []
+    return [str(value).strip()]
 
 
 def find_answer(*, save_screenshot: bool) -> None:
@@ -717,10 +1143,10 @@ def find_answer(*, save_screenshot: bool) -> None:
         print(f"ocr image saved: {ocr_visualize_path}", flush=True)
     
     try:
-        print("server response")
         model_response = call_server(cropped, prompt="")
     except Exception as e:
-        print(f"Error calling server: {e}", file=sys.stderr)
+        print(f"Error calling AI: {e}", file=sys.stderr)
+        _log_result(f"AI error: {e}")
         return    
 
     options = _normalize_correct_options(model_response.get("Correct option"))
@@ -788,7 +1214,8 @@ def ans_cp(*, save_screenshot: bool) -> None:
             prompt="Give answer to given question with details. Respond in JSON format like {\"Correct option\": \"<answer>\"}'",
         )
     except Exception as e:
-        print(f"Error calling server: {e}", file=sys.stderr)
+        print(f"Error calling AI: {e}", file=sys.stderr)
+        _log_result(f"AI error: {e}")
         return
     print("Model response:", model_response, flush=True)
     options = _normalize_correct_options(model_response.get("Correct option"))
@@ -807,7 +1234,7 @@ def ai_log_only(*, save_screenshot: bool) -> None:
     try:
         model_response = call_ai_google_search(cropped, prompt="")
     except Exception as e:
-        print(f"Error calling server: {e}", file=sys.stderr)
+        print(f"Error calling AI: {e}", file=sys.stderr)
         _log_result(f"AI log error: {e}")
         return
     _log_result(f"Correct option: {model_response.get('Correct option')}")
@@ -930,6 +1357,15 @@ def listen_global(
 
 def main() -> int:
     warmup_tesseract()
+    ai_mode, target_url = _get_effective_ai_mode_and_url()
+    ai_llm = _get_ai_setting("llm", "gemini")
+    ai_model = _get_ai_setting("model", "")
+    if ai_mode == "local":
+        print(f"Config loaded: mode=local | llm={ai_llm} | model={ai_model or '(default)'}", flush=True)
+    else:
+        print(f"Config loaded: mode=server | url={target_url}", flush=True)
+    print(f"Config path: {CONFIG_PATH}", flush=True)
+    print(f"Credentials path: {CREDENTIALS_PATH}", flush=True)
     ui_cfg = _CONFIG.get("ui", {})
     start_visible = bool(_CONFIG.get("hotkeys", {}).get("visible_by_default", True))
     _init_ui(

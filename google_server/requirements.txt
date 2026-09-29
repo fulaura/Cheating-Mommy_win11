@@ -1,0 +1,5 @@
+functions-framework==3.*
+google-genai
+flask>=2.2
+google-cloud-firestore>=2.11.0
+google-cloud-pubsub

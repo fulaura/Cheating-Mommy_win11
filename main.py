@@ -1260,6 +1260,125 @@ def _log_result(message: str) -> None:
     root.after(0, _refresh)
 
 
+def _get_active_modifiers() -> set[str]:
+    mods = set()
+    if os.name == "nt":
+        user32 = ctypes.windll.user32
+        if user32.GetAsyncKeyState(0x11) & 0x8000:  # VK_CONTROL
+            mods.add("ctrl")
+        if user32.GetAsyncKeyState(0x12) & 0x8000:  # VK_MENU (Alt)
+            mods.add("alt")
+        if user32.GetAsyncKeyState(0x10) & 0x8000:  # VK_SHIFT
+            mods.add("shift")
+        if (user32.GetAsyncKeyState(0x5B) & 0x8000) or (user32.GetAsyncKeyState(0x5C) & 0x8000):  # VK_LWIN / VK_RWIN
+            mods.add("win")
+    return mods
+
+
+def _normalize_key(key: keyboard.Key | keyboard.KeyCode) -> str | None:
+    if isinstance(key, keyboard.KeyCode):
+        if key.vk is not None:
+            if 0x41 <= key.vk <= 0x5A:
+                return chr(key.vk).lower()
+            if 0x30 <= key.vk <= 0x39:
+                return chr(key.vk)
+            if 0x70 <= key.vk <= 0x87:
+                return f"f{key.vk - 0x70 + 1}"
+            if 0x60 <= key.vk <= 0x69:
+                return f"num{key.vk - 0x60}"
+            vk_map = {
+                0x20: "space",
+                0x09: "tab",
+                0x0D: "enter",
+                0x08: "backspace",
+                0x2E: "delete",
+                0x2D: "insert",
+                0x24: "home",
+                0x23: "end",
+                0x21: "pageup",
+                0x22: "pagedown",
+                0x26: "up",
+                0x28: "down",
+                0x25: "left",
+                0x27: "right",
+                0xBA: ";",
+                0xBB: "=",
+                0xBC: ",",
+                0xBD: "-",
+                0xBE: ".",
+                0xBF: "/",
+                0xC0: "`",
+                0xDB: "[",
+                0xDC: "\\",
+                0xDD: "]",
+                0xDE: "'",
+            }
+            if key.vk in vk_map:
+                return vk_map[key.vk]
+
+        if key.char and ord(key.char) >= 32:
+            return key.char.lower()
+        return None
+
+    elif isinstance(key, keyboard.Key):
+        name = key.name.lower()
+        if name in (
+            "ctrl", "ctrl_l", "ctrl_r",
+            "alt", "alt_l", "alt_r", "alt_gr",
+            "shift", "shift_l", "shift_r",
+            "cmd", "cmd_l", "cmd_r"
+        ):
+            return None
+        if name.startswith("page_"):
+            return name.replace("page_", "page")
+        return name
+
+    return None
+
+
+class HotkeyBinding:
+    def __init__(self, raw: str | None, default: str):
+        val = str(raw).strip().lower() if raw is not None and str(raw).strip() else default
+        self.raw = val
+        parts = [p.strip().lower() for p in self.raw.split("+") if p.strip()]
+        self.modifiers = set()
+        self.trigger = ""
+        for p in parts:
+            if p in ("ctrl", "control"):
+                self.modifiers.add("ctrl")
+            elif p in ("alt", "menu"):
+                self.modifiers.add("alt")
+            elif p in ("shift",):
+                self.modifiers.add("shift")
+            elif p in ("win", "cmd", "super"):
+                self.modifiers.add("win")
+            else:
+                self.trigger = p
+
+    def matches(self, trigger: str, active_mods: set[str]) -> bool:
+        if not self.trigger or trigger.lower() != self.trigger:
+            return False
+        return self.modifiers == active_mods
+
+    def __str__(self) -> str:
+        mods = sorted(list(self.modifiers))
+        if self.trigger:
+            mods.append(self.trigger)
+        return "+".join(mods)
+
+
+class CompositeListener:
+    def __init__(self, *listeners):
+        self.listeners = listeners
+
+    def stop(self) -> None:
+        for l in self.listeners:
+            try:
+                l.stop()
+            except Exception:
+                pass
+
+
 def listen_global(
     *,
     debug: bool = False,
@@ -1267,25 +1386,60 @@ def listen_global(
     on_toggle=None,
     on_window_toggle=None,
     on_exit=None,
-) -> keyboard.Listener:
+) -> CompositeListener:
     hotkeys_cfg = _CONFIG.get("hotkeys", {})
-    answer_key = str(hotkeys_cfg.get("answer_key", "p")).strip().lower()[:1] or "p"
-    copy_key = str(hotkeys_cfg.get("copy_key", "o")).strip().lower()[:1] or "o"
-    info_key = str(hotkeys_cfg.get("info_key", "i")).strip().lower()[:1] or "i"
-    if answer_key == copy_key:
-        copy_key = "o" if answer_key != "o" else "p"
-    toggle_key = str(hotkeys_cfg.get("toggle_commands", "l")).strip().lower()[:1] or "l"
-    if toggle_key in (answer_key, copy_key, info_key):
-        toggle_key = "l"
-    window_key = str(hotkeys_cfg.get("window_visibility", "k")).strip().lower()[:1] or "k"
-    if window_key in (answer_key, copy_key, info_key):
-        window_key = "k"
-    if info_key in (answer_key, copy_key, toggle_key, window_key):
-        info_key = "i"
+    b_answer = HotkeyBinding(hotkeys_cfg.get("answer_key"), "p")
+    b_copy = HotkeyBinding(hotkeys_cfg.get("copy_key"), "o")
+    b_info = HotkeyBinding(hotkeys_cfg.get("info_key"), "i")
+    b_toggle = HotkeyBinding(hotkeys_cfg.get("toggle_commands"), "l")
+    b_window = HotkeyBinding(hotkeys_cfg.get("window_visibility"), "k")
+
     commands_enabled = bool(hotkeys_cfg.get("turned_on_by_default", False))
     window_visible = bool(hotkeys_cfg.get("visible_by_default", True))
     busy_lock = threading.Lock()
     busy = {"value": False}
+
+    class ClickTracker:
+        def __init__(self, max_interval: float = 0.45):
+            self.max_interval = max_interval
+            self.history: dict[tuple[str, tuple[str, ...]], list[float]] = {}
+            self.lock = threading.Lock()
+
+        def register_click(self, btn: str, active_mods: set[str]) -> list[str]:
+            now = time.time()
+            mods_key = tuple(sorted(list(active_mods)))
+            key = (btn, mods_key)
+
+            with self.lock:
+                prev = self.history.get(key, [])
+                chain: list[float] = []
+                for t in reversed(prev):
+                    if not chain:
+                        if (now - t) <= self.max_interval:
+                            chain.append(t)
+                    else:
+                        if (chain[-1] - t) <= self.max_interval:
+                            chain.append(t)
+                        else:
+                            break
+                chain.reverse()
+                chain.append(now)
+                self.history[key] = chain
+
+                count = len(chain)
+                events: list[str] = []
+                if count >= 3:
+                    events.append(f"triple_{btn}")
+                    # Clear chain so the next click starts a fresh cycle
+                    self.history[key] = []
+                elif count == 2:
+                    events.append(f"double_{btn}")
+
+                # Always include the single click trigger
+                events.append(btn)
+                return events
+
+    click_tracker = ClickTracker(max_interval=0.45)
 
     def _try_run_task(func) -> bool:
         with busy_lock:
@@ -1303,56 +1457,93 @@ def listen_global(
         threading.Thread(target=_worker, daemon=True).start()
         return True
 
-    def on_press(key: keyboard.Key | keyboard.KeyCode) -> bool | None:
-        try: ch = key.char
-        except AttributeError: return
-        if ch is None:
-            return
-
-        if debug: print(f"got: {ch!r}", flush=True)
-        ch_low = ch.lower()
+    def _handle_trigger(trigger: str) -> bool | None:
         nonlocal commands_enabled, window_visible
-        if ch_low == toggle_key:
+        mods = _get_active_modifiers()
+        if debug:
+            print(f"[hotkey debug] trigger='{trigger}', mods={mods}", flush=True)
+
+        # 1. Toggle commands (always available)
+        if b_toggle.matches(trigger, mods):
             commands_enabled = not commands_enabled
             state = "enabled" if commands_enabled else "disabled"
             print(f"commands {state}", flush=True)
             if on_toggle:
                 on_toggle(commands_enabled)
             return
-        if ch_low == window_key:
+
+        # 2. Toggle window visibility
+        if b_window.matches(trigger, mods):
             if not commands_enabled:
                 return
             window_visible = not window_visible
             if on_window_toggle:
                 on_window_toggle(window_visible)
             return
+
+        # 3. If commands disabled, don't run action hotkeys
         if not commands_enabled:
             return
-        if ch_low == answer_key:
-            print(f"{answer_key} is pressed", flush=True)
+
+        # 4. Action hotkeys
+        if b_answer.matches(trigger, mods):
+            print(f"{b_answer} is pressed", flush=True)
             if _try_run_task(lambda: find_answer(save_screenshot=save_screenshot)):
                 if _UI_STATE and _UI_STATE.get("action_log", True):
-                    _log_result(f"{answer_key} is pressed")
-        elif ch_low == copy_key:
-            print(f"{copy_key} is pressed", flush=True)
+                    _log_result(f"{b_answer} is pressed")
+        elif b_copy.matches(trigger, mods):
+            print(f"{b_copy} is pressed", flush=True)
             if _try_run_task(lambda: ans_cp(save_screenshot=save_screenshot)):
                 if _UI_STATE and _UI_STATE.get("action_log", True):
-                    _log_result(f"{copy_key} is pressed")
-        elif ch_low == info_key:
-            print(f"{info_key} is pressed", flush=True)
+                    _log_result(f"{b_copy} is pressed")
+        elif b_info.matches(trigger, mods):
+            print(f"{b_info} is pressed", flush=True)
             if _try_run_task(lambda: ai_log_only(save_screenshot=save_screenshot)):
                 if _UI_STATE and _UI_STATE.get("action_log", True):
-                    _log_result(f"{info_key} is pressed")
-        elif ch == "\x11":
+                    _log_result(f"{b_info} is pressed")
+
+    def on_key_press(key: keyboard.Key | keyboard.KeyCode) -> bool | None:
+        # Check Ctrl+Q for exit
+        char = getattr(key, "char", None)
+        vk = getattr(key, "vk", None)
+        if char == "\x11" or ((vk == 0x51 or (char and char.lower() == "q")) and "ctrl" in _get_active_modifiers()):
             print("Ctrl+Q pressed, exiting...", flush=True)
             if on_exit:
                 on_exit()
             return False
 
-    print(f"Listening globally for toggle '{toggle_key}' (Ctrl+C to exit)...", flush=True)
-    listener = keyboard.Listener(on_press=on_press)
-    listener.start()
-    return listener
+        norm = _normalize_key(key)
+        if norm:
+            _handle_trigger(norm)
+
+    def on_mouse_click(x, y, button, pressed) -> None:
+        if not pressed:
+            return
+        btn_name = getattr(button, "name", str(button)).lower()
+        mods = _get_active_modifiers()
+        triggers = click_tracker.register_click(btn_name, mods)
+        # Check higher-order triggers (triple, then double, then single)
+        for trig in triggers:
+            _handle_trigger(trig)
+
+    def on_mouse_scroll(x, y, dx, dy) -> None:
+        if dy > 0:
+            _handle_trigger("wheel_up")
+        elif dy < 0:
+            _handle_trigger("wheel_down")
+
+    kb_listener = keyboard.Listener(on_press=on_key_press)
+    kb_listener.start()
+
+    mouse_listener = mouse.Listener(on_click=on_mouse_click, on_scroll=on_mouse_scroll)
+    mouse_listener.start()
+
+    print(
+        f"Hotkeys loaded: answer={b_answer} | copy={b_copy} | info={b_info} | toggle={b_toggle} | window={b_window}",
+        flush=True,
+    )
+    print(f"Listening globally for toggle '{b_toggle}' (Ctrl+C or Ctrl+Q to exit)...", flush=True)
+    return CompositeListener(kb_listener, mouse_listener)
 
 
 def main() -> int:
@@ -1404,12 +1595,24 @@ def main() -> int:
         help="Save screenshots to ./img for debugging.",
     )
     args = parser.parse_args()
+    def _do_exit() -> None:
+        try:
+            if listener:
+                listener.stop()
+        except Exception:
+            pass
+        try:
+            root.destroy()
+        except Exception:
+            pass
+        os._exit(0)
+
     listener = listen_global(
         debug=args.debug,
         save_screenshot=args.save_screenshot,
         on_toggle=None,
         on_window_toggle=lambda visible: (_apply_window_pos(root, ui_cfg.get("window_pos", "mouse")), _show_window(root)) if visible else _hide_window(root),
-        on_exit=lambda: root.after(0, root.quit),
+        on_exit=_do_exit,
     )
     try:
         root.mainloop()

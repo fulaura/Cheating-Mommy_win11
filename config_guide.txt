@@ -78,28 +78,37 @@ ocr.crop_bbox (list)
 ocr.crop_clamp (bool)
   Clamp crop_bbox to the screenshot bounds if it goes out of range.
 
+hotkeys (Keyboard and Mouse Shortcuts):
+  (You can configure these by launching tools/hotkey_configuration.exe or editing config.json)
+  Supports keyboard keys, mouse buttons, multi-clicks, and modifier combinations (ctrl+, alt+, shift+, win+):
+  - Mouse buttons: "left", "right", "middle" (wheel click), "x1" (thumb back), "x2" (thumb forward), "wheel_up", "wheel_down"
+  - Multi-click triggers: "triple_left" (triple-click left mouse!), "double_left", "triple_right", "triple_middle", "triple_x1", etc.
+  - Modifier examples: "triple_left", "ctrl+x1", "alt+middle", "shift+p", "ctrl+p", "x1"
+
 hotkeys.toggle_commands (string)
-  Single key that toggles command hotkeys (p/o) on or off.
-  If set to "p" or "o", it falls back to "l".
+  Key or mouse button that toggles command hotkeys on or off (default "l").
 
 hotkeys.window_visibility (string)
-  Single key that toggles the AI window visibility.
-  If set to "p" or "o", it falls back to "k".
+  Key or mouse button that toggles the AI window overlay visibility (default "k").
 
 hotkeys.turned_on_by_default (bool)
-  If true, p/o are enabled at startup. If false, toggle key enables them.
+  If true, action hotkeys are enabled at startup. If false, toggle key enables them.
 
 hotkeys.visible_by_default (bool)
   If true, the window is shown on startup. If false, it starts hidden.
 
 hotkeys.answer_key (string)
-  Key to trigger answer selection (default "p").
+  Key or mouse button to trigger answer screenshot, AI solve, and auto-click (default "p").
+  Example: "triple_left", "p", "x1", "ctrl+x1", "middle".
 
 hotkeys.copy_key (string)
-  Key to copy the answer (default "o").
+  Key or mouse button to copy the answer to clipboard (default "o").
+  Example: "o", "x2", "ctrl+x2", "double_middle".
 
 hotkeys.info_key (string)
-  Key to request AI log-only response (default "i").
+  Key or mouse button to request AI log-only response with Google search (default "i").
+  Example: "i", "ctrl+middle", "alt+x1", "triple_right".
+
 
 ui.window_pos (string or list)
   "mouse" to show near the cursor, "default" to keep current position.

@@ -96,6 +96,8 @@ std::string format_display_val(const std::string& key, const std::string& val) {
 }
 
 int main() {
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
     std::string path = appdata_path();
     auto kv = load_kv(path);
 
@@ -119,7 +121,6 @@ int main() {
     while (true) {
         std::cout << "\n============================================\n";
         std::cout << "          Update Credentials\n";
-        std::cout << "Target: " << path << "\n";
         std::cout << "============================================\n";
         for (size_t i = 0; i < keys.size(); ++i) {
             const auto& k = keys[i];

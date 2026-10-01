@@ -18,10 +18,11 @@ SolidCompression=yes
 ; Main app folder
 Source: "dist\{#AppName}.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "dist\{#AppName}_console.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "config.json"; DestDir: "{app}"; Flags: ignoreversion onlyifdoesntexist
+Source: "config.json"; DestDir: "{app}"; Flags: ignoreversion onlyifdoesntexist; Permissions: users-modify
 Source: "config_guide.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "crop_region.exe"; DestDir: "{app}\tools"; Flags: ignoreversion
 Source: "update_credentials.exe"; DestDir: "{app}\tools"; Flags: ignoreversion
+Source: "hotkey_configuration.exe"; DestDir: "{app}\tools"; Flags: ignoreversion
 
 ; Tesseract to AppData
 Source: "tesseract\*"; DestDir: "{code:GetDataDir}\tesseract"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -30,14 +31,17 @@ Source: "credentials_template.txt"; DestDir: "{code:GetDataDir}"; DestName: "cre
 [Tasks]
 Name: "desktop_main"; Description: "Create Desktop shortcut for {#AppName}"
 Name: "desktop_update"; Description: "Create Desktop shortcut for Update Credentials(used for login)"
+Name: "desktop_hotkeys"; Description: "Create Desktop shortcut for Hotkey Configuration"
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppName}.exe"
 Name: "{group}\{#AppName} Console"; Filename: "{app}\{#AppName}_console.exe"
 Name: "{group}\Update Credentials"; Filename: "{app}\tools\update_credentials.exe"
+Name: "{group}\Hotkey Configuration"; Filename: "{app}\tools\hotkey_configuration.exe"
 Name: "{group}\Crop Region"; Filename: "{app}\tools\crop_region.exe"
 Name: "{commondesktop}\{#AppName}"; Filename: "{app}\{#AppName}.exe"; Tasks: desktop_main
 Name: "{commondesktop}\Update Credentials"; Filename: "{app}\tools\update_credentials.exe"; Tasks: desktop_update
+Name: "{commondesktop}\Hotkey Configuration"; Filename: "{app}\tools\hotkey_configuration.exe"; Tasks: desktop_hotkeys
 
 [Run]
 ; Optional: launch app after install

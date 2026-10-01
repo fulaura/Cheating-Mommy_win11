@@ -54,6 +54,10 @@ mouse.jitter (float, pixels)
   Can be a list [min, max] to randomize each move.
   A single-item list (e.g., [2]) is treated as a constant.
 
+ocr.lang (string)
+  OCR languages to recognize separated by '+' (e.g. "rus+eng", "eng", "kaz+rus+eng").
+  Defaults to "rus+eng" to accurately recognize both English and Cyrillic/Russian texts.
+
 ocr.config (string)
   Optional Tesseract config string. Leave empty for defaults.
   Example:

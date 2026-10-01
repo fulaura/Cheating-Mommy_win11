@@ -63,6 +63,7 @@ def ocr(
     image: Image.Image | None = None,
     *,
     config: str | None = None,
+    lang: str = "rus+eng",
     crop_bbox: tuple[int, int, int, int] | None = None,
     crop_clamp: bool = True,
     mode: str = "chunk",  # "line" or "chunk"
@@ -106,10 +107,25 @@ def ocr(
         offset_y = top
         image = original_image.crop((left, top, right, bottom))
 
+    extra_kwargs: dict = {"output_type": pytesseract.Output.DICT}
+    if lang:
+        extra_kwargs["lang"] = lang
     if config:
-        data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT, config=config)
-    else:
-        data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
+        extra_kwargs["config"] = config
+
+    try:
+        data = pytesseract.image_to_data(image, **extra_kwargs)
+    except Exception:
+        # Fallback if configured language packs are missing
+        if lang and lang != "eng":
+            extra_kwargs["lang"] = "eng"
+            try:
+                data = pytesseract.image_to_data(image, **extra_kwargs)
+            except Exception:
+                extra_kwargs.pop("lang", None)
+                data = pytesseract.image_to_data(image, **extra_kwargs)
+        else:
+            raise
 
     results = []
 

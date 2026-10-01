@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import difflib
 import io
 import json
 import getpass
@@ -12,6 +13,7 @@ import re
 import subprocess
 import sys
 import time
+import unicodedata
 from dataclasses import dataclass
 import ctypes
 import threading
@@ -53,6 +55,7 @@ def _default_config() -> dict:
             "jitter": 0.0,
         },
         "ocr": {
+            "lang": "rus+eng",
             "config": "",
             "mode": "chunk",
             "x_thresh": 20,
@@ -1076,21 +1079,125 @@ def copy_to_clipboard_windows(text: str) -> None:
     subprocess.run(["clip"], input=text.encode("utf-8"), check=True)
 
 
+def _clean_option_prefix(text: str) -> str:
+    """Strip leading option markers like A., B), 1., 1), (a), etc."""
+    return re.sub(r'^\s*(?:\([a-zA-Z0-9]+\)|[a-zA-Z0-9]+[\.\)\:\-])\s*', '', text)
+
+
+def _normalize_text_for_match(text: str) -> str:
+    if not text:
+        return ""
+    text = _clean_option_prefix(text.strip())
+    reps = [
+        (r'\\nu\b', 'v'), ('ν', 'v'), ('η', 'n'), ('—', '-'), ('–', '-'), ('−', '-'),
+        ('“', '"'), ('”', '"'), ('«', '"'), ('»', '"'),
+        ('‘', "'"), ('’', "'"), ('×', '*'), ('÷', '/'),
+        ('≠', '!='), ('≤', '<='), ('≥', '>='), ('²', '^2'), ('³', '^3'),
+        ('\n', ' ')
+    ]
+    for pat, rep in reps:
+        if pat.startswith(r'\\'):
+            text = re.sub(pat, rep, text, flags=re.IGNORECASE)
+        else:
+            text = text.replace(pat, rep)
+    text = unicodedata.normalize('NFKD', text)
+    text = "".join(c for c in text if not (0x0300 <= ord(c) <= 0x036F))
+    text = text.lower()
+    text = re.sub(r'\s*=\s*', '=', text)
+    text = re.sub(r'[\s_]+', ' ', text).strip()
+    return text
+
+
+def _merge_bboxes(bboxes: list[tuple[int, int, int, int]]) -> tuple[int, int, int, int]:
+    min_x = min(b[0] for b in bboxes)
+    min_y = min(b[1] for b in bboxes)
+    max_x = max(b[0] + b[2] for b in bboxes)
+    max_y = max(b[1] + b[3] for b in bboxes)
+    return (min_x, min_y, max_x - min_x, max_y - min_y)
+
+
 def bbox_for_contains(ocr_results: list[dict], needle: str, strict: bool = False) -> tuple[int, int, int, int] | None:
-    n = needle.strip().lower()
-    for idx, item in enumerate(ocr_results):
-        if strict:
-            n_items = len(ocr_results)
-            combined_items: list[str] = []
-            for a in range(idx + 1, min(idx + 4, n_items)):
-                combined_items.append(ocr_results[a]["text"].strip().lower())
-            combined = " ".join(combined_items)
-            print("Combined text:", combined, flush=True)
-            if n in combined and (idx + 3) < n_items:
-                # print("Found in combined text", flush=True)
-                return ocr_results[idx + 3]["bbox"]
-        if n in item["text"].lower():
+    if not needle or not ocr_results:
+        return None
+
+    raw_needle = needle.strip()
+    norm_needle = _normalize_text_for_match(raw_needle)
+    if not norm_needle:
+        return None
+
+    # Handle very short needles (e.g. "5", "a", "no", "yes") safely
+    if len(norm_needle) <= 3:
+        for item in ocr_results:
+            raw_t = item.get("text", "").strip()
+            norm_t = _normalize_text_for_match(raw_t)
+            if norm_needle == norm_t or norm_needle == raw_t.lower():
+                return item["bbox"]
+            pattern = r'(?<![0-9/])' + re.escape(norm_needle) + r'(?![0-9/])'
+            if re.search(pattern, norm_t) or re.search(pattern, raw_t.lower()):
+                return item["bbox"]
+        return None
+
+    # Pass 1: Check single chunks
+    for item in ocr_results:
+        raw_t = item.get("text", "").strip()
+        norm_t = _normalize_text_for_match(raw_t)
+        if not norm_t:
+            continue
+        if norm_needle == norm_t:
             return item["bbox"]
+        if norm_needle in norm_t:
+            return item["bbox"]
+        if len(norm_t) >= 12 and norm_t in norm_needle and (len(norm_t) / len(norm_needle) >= 0.45):
+            return item["bbox"]
+
+    # Pass 2: Multi-chunk sliding window (1 to 10 chunks)
+    n_items = len(ocr_results)
+    best_score = 0.0
+    best_bbox = None
+    needle_words = set(re.findall(r'\w+', norm_needle))
+
+    for i in range(n_items):
+        combined_texts: list[str] = []
+        combined_bboxes: list[tuple[int, int, int, int]] = []
+        for k in range(1, min(11, n_items - i + 1)):
+            chunk = ocr_results[i + k - 1]
+            txt = chunk.get("text", "").strip()
+            if not txt:
+                continue
+            combined_texts.append(txt)
+            combined_bboxes.append(chunk["bbox"])
+
+            combined_str = " ".join(combined_texts)
+            norm_combined = _normalize_text_for_match(combined_str)
+
+            # Check exact containment in combined window
+            if norm_needle in norm_combined or (len(norm_combined) >= 15 and norm_combined in norm_needle and len(norm_combined) / len(norm_needle) >= 0.7):
+                if len(combined_bboxes) > 1 and combined_bboxes[0][2] < 35:
+                    return combined_bboxes[1]
+                return combined_bboxes[0]
+
+            # Sequence similarity
+            sim = difflib.SequenceMatcher(None, norm_needle, norm_combined).ratio()
+
+            if needle_words:
+                comb_words = set(re.findall(r'\w+', norm_combined))
+                overlap = len(needle_words & comb_words) / len(needle_words)
+                score = 0.55 * sim + 0.45 * overlap
+            else:
+                score = sim
+
+            if score > best_score:
+                best_score = score
+                if len(combined_bboxes) > 1 and combined_bboxes[0][2] < 35:
+                    best_bbox = combined_bboxes[1]
+                else:
+                    best_bbox = combined_bboxes[0]
+
+    # Acceptance threshold
+    threshold = 0.65 if len(norm_needle) > 25 else 0.72
+    if best_score >= threshold and best_bbox is not None:
+        return best_bbox
+
     return None
 
 
@@ -1138,6 +1245,7 @@ def find_answer(*, save_screenshot: bool) -> None:
         y_thresh=float(ocr_cfg.get("y_thresh", 4)),
         group_y_thresh=float(ocr_cfg.get("group_y_thresh", 35)),
         config=ocr_cfg.get("config") or None,
+        lang=str(ocr_cfg.get("lang", "rus+eng")),
     )
     if ocr_visualize_path:
         print(f"ocr image saved: {ocr_visualize_path}", flush=True)
@@ -1154,18 +1262,14 @@ def find_answer(*, save_screenshot: bool) -> None:
         bbox = bbox_for_contains(ocr_results, option)
         found = bbox is not None
         if bbox is None:
-            print("Error. Trying next bbox option...", flush=True)
-            bbox = bbox_for_contains(ocr_results, option, strict=True)
-            if bbox is None:
-                print(
-                    f"Could not find bbox for answer option on second try, skipping: {option!r}",
-                    file=sys.stderr,
-                )
-                _log_result(f"Answer: {option} | OCR: not found")
-                continue
-            found = True
+            print(
+                f"Could not find bbox for answer option: {option!r}",
+                file=sys.stderr,
+            )
+            _log_result(f"Answer: {option} | OCR: not found")
+            continue
         print(f"Clicking answer option: {option!r} at pos: {bbox}")
-        _log_result(f"Answer: {option} | OCR: {'found' if found else 'not found'}")
+        _log_result(f"Answer: {option} | OCR: found")
         click_bbox_windows(
             bbox,
             rule="random",
@@ -1205,6 +1309,7 @@ def ans_cp(*, save_screenshot: bool) -> None:
         y_thresh=float(ocr_cfg.get("y_thresh", 4)),
         group_y_thresh=float(ocr_cfg.get("group_y_thresh", 35)),
         config=ocr_cfg.get("config") or None,
+        lang=str(ocr_cfg.get("lang", "rus+eng")),
     )
     if ocr_visualize_path:
         print(f"ocr image saved: {ocr_visualize_path}", flush=True)

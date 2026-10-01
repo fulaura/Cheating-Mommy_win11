@@ -9,6 +9,7 @@
     "jitter": [0, 5]
   },
   "ocr": {
+    "lang": "rus+eng",
     "config": "",
     "mode": "chunk",
     "x_thresh": 20,
